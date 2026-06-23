@@ -82,6 +82,8 @@ public:
                                      uint64_t startId, uint64_t endId);
     __aicore__ inline void CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx, int64_t realS2Idx,
                                           int64_t keyBNBOffset,int64_t s2IdLimit, const RunInfo &runInfo);
+    __aicore__ inline void CopyPackedKvRowsToUb(LocalTensor<KV_INT8_T> dstUb, GlobalTensor<KV_INT8_T> srcGm,
+                                                uint32_t rowCount);
     // ================================Vector1==========================================
     __aicore__ inline void ProcessVec1SingleBuf(const RunInfo &info, const MSplitInfo &mSplitInfo);
     __aicore__ inline void DealBmm1ResBaseBlock(const RunInfo &info, const MSplitInfo &mSplitInfo, uint32_t startRow,
@@ -132,6 +134,7 @@ public:
     static constexpr uint32_t KV_MERGE_STAGE_ROWS = 32U;
     static constexpr uint32_t KV_PACKED_ROW_SIZE = 528U;
     static constexpr uint32_t KV_MERGE_STAGE_MAX_DIM = 544U;
+    static constexpr uint32_t KV_MERGE_UB_ROW_PAD = KV_MERGE_STAGE_MAX_DIM - KV_PACKED_ROW_SIZE;
     static constexpr uint32_t KV_TILE_SIZE = 128U;
     static constexpr uint32_t KV_TILE_NUM = 4U;
     static constexpr uint32_t DQ_ALIGNED_ROW_BYTES = 544U;
@@ -886,8 +889,8 @@ __aicore__ inline void SFAVectorService<SFAT>::DequantInt8RowPerTile(LocalTensor
                                                                     LocalTensor<KV_INT8_T> packedRowUb,
                                                                     uint32_t headDim)
 {
-    // kvMergUb_ rows are spaced by 528 bytes, so odd rows are only 16B-aligned and
-    // cannot be used directly by vector Cast/Muls. Copy to a 32B-aligned staging row first.
+    // CopyIn stores each packed row in a 544-byte UB slot (32B aligned). Copy one row into
+    // tmpBuff1 staging before vector Cast/Muls when the source row is not 32B aligned.
     LocalTensor<KV_INT8_T> alignedRowUb =
         tmpBuff1.GetWithOffset<KV_INT8_T>(KV_MERGE_STAGE_MAX_DIM, 0);
     DataCopy(alignedRowUb, packedRowUb, KV_PACKED_ROW_SIZE);
@@ -908,6 +911,23 @@ __aicore__ inline void SFAVectorService<SFAT>::DequantInt8RowPerTile(LocalTensor
 }
 
 template <typename SFAT>
+__aicore__ inline void SFAVectorService<SFAT>::CopyPackedKvRowsToUb(LocalTensor<KV_INT8_T> dstUb,
+                                                                    GlobalTensor<KV_INT8_T> srcGm,
+                                                                    uint32_t rowCount)
+{
+    if (rowCount == 0) {
+        return;
+    }
+    DataCopyExtParams intriParams;
+    intriParams.blockLen = KV_PACKED_ROW_SIZE * sizeof(KV_INT8_T);
+    intriParams.blockCount = rowCount;
+    intriParams.dstStride = KV_MERGE_UB_ROW_PAD * sizeof(KV_INT8_T);
+    intriParams.srcStride = 0;
+    DataCopyPadExtParams<KV_INT8_T> padParams;
+    DataCopyPad(dstUb, srcGm, intriParams, padParams);
+}
+
+template <typename SFAT>
 __aicore__ inline void
 SFAVectorService<SFAT>::CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx, int64_t realS2Idx,
                                        int64_t keyBNBOffset,int64_t s2IdLimit, const RunInfo &runInfo)
@@ -918,19 +938,17 @@ SFAVectorService<SFAT>::CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int6
     int64_t validS2Count =
         (realS2Idx + constInfo.sparseBlockSize > s2IdLimit ? s2IdLimit - realS2Idx : constInfo.sparseBlockSize);
     const uint64_t kvGmStride = constInfo.kvStorageDim;
-    const uint64_t stageRowStride = constInfo.kvStorageDim;
+    const uint64_t ubRowBase =
+        mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * KV_MERGE_STAGE_MAX_DIM + (mte2Size - mte3Size) * KV_MERGE_STAGE_MAX_DIM;
+    CopyPackedKvRowsToUb(kvMergUb_[ubRowBase], keyGm_[keyBNBOffset * kvGmStride],
+                         static_cast<uint32_t>(validS2Count));
+
     DataCopyExtParams intriParams;
-    intriParams.blockLen = validS2Count * stageRowStride * sizeof(KV_INT8_T);
+    intriParams.blockLen = validS2Count * constInfo.headDimRope * sizeof(KV_T);
     intriParams.blockCount = 1;
     intriParams.dstStride = 0;
     intriParams.srcStride = 0;
-    DataCopyPadExtParams<KV_INT8_T> padParams;
-    DataCopyPad(kvMergUb_[mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * KV_MERGE_STAGE_MAX_DIM +
-                          (mte2Size - mte3Size) * stageRowStride],
-                keyGm_[keyBNBOffset * kvGmStride], intriParams, padParams);
-    intriParams.blockLen = validS2Count * constInfo.headDimRope * sizeof(KV_T);
     DataCopyPadExtParams<KV_T> ropePadParams;
-
     DataCopyPad(ropeMergUb_[mergeMte3Idx % 2 * 32 * 64 + (mte2Size - mte3Size) * constInfo.headDimRope],
                 keyRopeGm_[keyBNBOffset * constInfo.headDimRope], intriParams, ropePadParams);
     mte2Size += validS2Count;
@@ -979,29 +997,44 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInKv(int64_t &mte2Size, int64
         CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx2, keyOffset2, s2IdLimit, runInfo);
     } else {
         const uint64_t kvGmStride = constInfo.kvStorageDim;
-        const uint64_t stageRowStride = constInfo.kvStorageDim;
-        DataCopyExtParams intriParams;
-        intriParams.blockLen = constInfo.sparseBlockSize * stageRowStride * sizeof(KV_INT8_T);
-        intriParams.blockCount = (keyOffset1 >= 0) + (keyOffset2 >= 0);
-        intriParams.dstStride = 0;
-        intriParams.srcStride = keySrcStride;
-        DataCopyPadExtParams<KV_INT8_T> padParams;
-
-        int64_t startGmOffset = keyOffset1 > -1 ? keyOffset1 : keyOffset2;
-        if (keyOffset2 > -1 && keyOffset2 < keyOffset1) {
-            startGmOffset = keyOffset2;
+        const uint32_t sparseBlockSize = constInfo.sparseBlockSize;
+        uint64_t ubRowBase =
+            mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * KV_MERGE_STAGE_MAX_DIM + (mte2Size - mte3Size) * KV_MERGE_STAGE_MAX_DIM;
+        int64_t firstKeyOffset = keyOffset1 > -1 ? keyOffset1 : keyOffset2;
+        int64_t secondKeyOffset = -1;
+        if (keyOffset1 > -1 && keyOffset2 > -1) {
+            if (keyOffset1 <= keyOffset2) {
+                firstKeyOffset = keyOffset1;
+                secondKeyOffset = keyOffset2;
+            } else {
+                firstKeyOffset = keyOffset2;
+                secondKeyOffset = keyOffset1;
+            }
         }
-        DataCopyPad(kvMergUb_[mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * KV_MERGE_STAGE_MAX_DIM +
-                              (mte2Size - mte3Size) * stageRowStride],
-                    keyGm_[startGmOffset * kvGmStride], intriParams, padParams);
+        CopyPackedKvRowsToUb(kvMergUb_[ubRowBase], keyGm_[firstKeyOffset * kvGmStride], sparseBlockSize);
+        if (secondKeyOffset > -1) {
+            CopyPackedKvRowsToUb(kvMergUb_[ubRowBase + sparseBlockSize * KV_MERGE_STAGE_MAX_DIM],
+                                 keyGm_[secondKeyOffset * kvGmStride], sparseBlockSize);
+        }
 
-        intriParams.blockLen = constInfo.sparseBlockSize * constInfo.headDimRope * sizeof(KV_T);
+        int64_t startRopeOffset = firstKeyOffset;
+        if constexpr (!PAGE_ATTENTION) {
+            int64_t keyRopeOffset1 = GetKeyRopeGmOffset(realS2Idx1, runInfo, s2IdLimit);
+            int64_t keyRopeOffset2 = GetKeyRopeGmOffset(realS2Idx2, runInfo, s2IdLimit);
+            startRopeOffset = keyOffset1 > -1 ? keyRopeOffset1 : keyRopeOffset2;
+            if (keyOffset1 > -1 && keyOffset2 > -1) {
+                startRopeOffset = (keyRopeOffset1 <= keyRopeOffset2) ? keyRopeOffset1 : keyRopeOffset2;
+            }
+        }
+        DataCopyExtParams intriParams;
+        intriParams.blockLen = sparseBlockSize * constInfo.headDimRope * sizeof(KV_T);
+        intriParams.blockCount = (keyOffset1 >= 0) + (keyOffset2 >= 0);
         intriParams.dstStride = 0;
         intriParams.srcStride = keyRopeSrcStride;
         DataCopyPadExtParams<KV_T> ropePadParams;
         DataCopyPad(ropeMergUb_[mergeMte3Idx % 2 * 32 * 64 + (mte2Size - mte3Size) * constInfo.headDimRope],
-                    keyRopeGm_[startGmOffset * constInfo.headDimRope], intriParams, ropePadParams);
-        mte2Size += ((keyOffset1 > -1) + (keyOffset2 > -1)) * constInfo.sparseBlockSize;
+                    keyRopeGm_[startRopeOffset * constInfo.headDimRope], intriParams, ropePadParams);
+        mte2Size += ((keyOffset1 > -1) + (keyOffset2 > -1)) * sparseBlockSize;
     }
 }
 
@@ -1017,10 +1050,9 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyOutMrgeResult(int64_t mte2Siz
     WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
 
     int64_t rowCount = mte2Size - mte3Size;
-    const uint64_t stageRowStride = constInfo.kvStorageDim;
+    const uint64_t ubRowBase = mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * KV_MERGE_STAGE_MAX_DIM;
     for (int64_t rowIdx = 0; rowIdx < rowCount; ++rowIdx) {
-        LocalTensor<KV_INT8_T> srcInt8RowUb =
-            kvMergUb_[mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * KV_MERGE_STAGE_MAX_DIM + rowIdx * stageRowStride];
+        LocalTensor<KV_INT8_T> srcInt8RowUb = kvMergUb_[ubRowBase + rowIdx * KV_MERGE_STAGE_MAX_DIM];
         DequantInt8RowPerTile(dequantTmpUb_, srcInt8RowUb, constInfo.headDim);
         DataCopyExtParams rowCopyParams;
         rowCopyParams.blockCount = 1;
