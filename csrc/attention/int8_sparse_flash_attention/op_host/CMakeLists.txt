@@ -54,7 +54,7 @@ function(__int8_sfa_verify_kernel_headers)
     set(_cube "${_arch22}/int8_sparse_flash_attention_service_cube_mla.h")
     set(_kernel "${_arch22}/int8_sparse_flash_attention_kernel_mla.h")
     set(_expected_cube_lines 1121)
-    set(_expected_kernel_lines 1024)
+    set(_expected_kernel_lines 1026)
 
     foreach (_hdr IN ITEMS "${_cube}" "${_kernel}")
         if (NOT EXISTS "${_hdr}")

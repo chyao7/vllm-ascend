@@ -39,6 +39,8 @@ from tbe.tikcpp import compile_op, replay_op, check_op_cap, generalize_op_params
 from tbe.tikcpp.compile_op import CommonUtility, AscendCLogLevel
 from tbe.common.buildcfg import get_default_build_config
 from tbe.common.buildcfg import get_current_build_config
+import functools
+import inspect
 import tbe.common.register as tbe_register
 PYF_PATH = os.path.dirname(os.path.realpath(__file__))
 
@@ -164,8 +166,23 @@ def get_kernel_source(src_file, dir_snake, dir_ex):
 
 '''
 
+COERCE_ATTRS_DECORATOR = '''
+def _ascendc_coerce_attrs_{op_intf}(func):
+    _signature = inspect.signature(func)
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        bound = _signature.bind_partial(*args, **kwargs)
+        bound.apply_defaults()
+{coerce_lines}
+        return func(**bound.arguments)
+
+    return wrapper
+'''
+
 IMPL_API = """
 @tbe_register.register_operator("{}", trans_bool_to_s8=False)
+@_ascendc_coerce_attrs_{}
 @para_check.check_op_params({})
 def {}({}, kernel_name="{}"{}):
 {}
@@ -498,6 +515,30 @@ class AdpBuilder(opdesc_parser.OpDesc):
             return '["' + '", "'.join(self.mc2_ctx) + '"]'
         return "[]"
 
+    def _format_attr_default_value(self: any, attr: str, attrval: str) -> str:
+        attr_type = self.attr_val.get(attr).get("type")
+        if attr_type == "bool":
+            return str(attrval).capitalize()
+        if attr_type == "str":
+            return '"' + str(attrval) + '"'
+        if attr_type == "float":
+            return str(attrval).strip().strip('"').rstrip("f")
+        if attr_type == "int":
+            return str(attrval).strip().strip('"')
+        return str(attrval)
+
+    def _build_attr_coercion(self: any) -> str:
+        lines = []
+        for attr in self.attr_list:
+            attr_type = self.attr_val.get(attr).get("type")
+            if attr_type == "float":
+                lines.append(f"        if {attr} is not None and isinstance({attr}, str):")
+                lines.append(f"            {attr} = float({attr})")
+            elif attr_type == "int":
+                lines.append(f"        if {attr} is not None and isinstance({attr}, str):")
+                lines.append(f"            {attr} = int({attr})")
+        return "\n".join(lines) if lines else "        pass"
+
     def _build_paradefault(self: any):
         optional = False
         argtypes = []
@@ -517,11 +558,7 @@ class AdpBuilder(opdesc_parser.OpDesc):
             attrval = self.attr_val.get(attr).get("defaultValue")
             if attrval is not None:
                 optional = True
-                if atype == "bool":
-                    attrval = attrval.capitalize()
-                elif atype == "str":
-                    attrval = '"' + attrval + '"'
-                self.argsdefv.append(attrval)
+                self.argsdefv.append(self._format_attr_default_value(attr, attrval))
                 continue
             if optional:
                 self.argsdefv.append(ATTR_DEFAULT.get(self.attr_val.get(attr).get("type")))
@@ -628,8 +665,15 @@ class AdpBuilder(opdesc_parser.OpDesc):
         src = self.op_file + ".cpp"
         virt_exprs = self._build_virtual()
         fd.write(
+            COERCE_ATTRS_DECORATOR.format(
+                op_intf=self.op_intf,
+                coerce_lines=self._build_attr_coercion(),
+            )
+        )
+        fd.write(
             IMPL_API.format(
                 self.op_type,
+                self.op_intf,
                 pchk,
                 self.op_intf,
                 argsdef,

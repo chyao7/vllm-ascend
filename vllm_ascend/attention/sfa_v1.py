@@ -21,8 +21,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.sfa_k_nope_pack import (
-    scatter_k_pe_to_cache,
-    scatter_packed_k_nope_to_cache,
+    quantize_k_nope_per_group,
     use_910b_packed_k_nope_sparse_c8,
 )
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -858,6 +857,42 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _get_full_kv(self, k, attn_metadata):
         return k
 
+    def _get_output_kv_rmsnorm_rope_cache_placeholders(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Minimal bf16 caches for npu_kv_rmsnorm_rope_cache(is_output_kv=True).
+
+        910B packed C8 stores k_nope in int8 kv_cache[0], which this op cannot
+        accept. With is_output_kv=True the op does not write cache anyway.
+        """
+        k_pe_cache = torch.zeros(
+            (1, 1, 1, self.qk_rope_head_dim),
+            dtype=dtype,
+            device=device,
+        )
+        k_nope_cache = torch.zeros(
+            (1, 1, 1, self.kv_lora_rank),
+            dtype=dtype,
+            device=device,
+        )
+        return k_pe_cache, k_nope_cache
+
+    def _resolve_kv_rmsnorm_rope_caches(
+        self,
+        kv_cache: tuple,
+        kv_no_split: torch.Tensor,
+        *,
+        is_output_kv: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if is_output_kv and self.use_sparse_c8_indexer and use_910b_packed_k_nope_sparse_c8():
+            return self._get_output_kv_rmsnorm_rope_cache_placeholders(
+                kv_no_split.device,
+                kv_no_split.dtype,
+            )
+        return kv_cache[1], kv_cache[0]
+
     def _write_k_nope_k_pe_cache(
         self,
         k_nope: torch.Tensor,
@@ -870,18 +905,16 @@ class AscendSFAImpl(MLAAttentionImpl):
         k_nope = k_nope[:num_tokens]
         k_pe = k_pe[:num_tokens]
         if self.use_sparse_c8_indexer and use_910b_packed_k_nope_sparse_c8():
-            scatter_packed_k_nope_to_cache(k_nope, kv_cache[0], slots)
-            scatter_k_pe_to_cache(k_pe, kv_cache[1], slots)
-        else:
-            k_nope = k_nope.view(k_nope.shape[0], 1, -1)
-            k_pe = k_pe.view(k_pe.shape[0], 1, -1)
-            DeviceOperator.reshape_and_cache(
-                key=k_nope,
-                value=k_pe,
-                key_cache=kv_cache[0],
-                value_cache=kv_cache[1],
-                slot_mapping=slots,
-            )
+            k_nope = quantize_k_nope_per_group(k_nope).view(torch.int8)
+        k_nope = k_nope.view(k_nope.shape[0], 1, -1)
+        k_pe = k_pe.view(k_pe.shape[0], 1, -1)
+        DeviceOperator.reshape_and_cache(
+            key=k_nope,
+            value=k_pe,
+            key_cache=kv_cache[0],
+            value_cache=kv_cache[1],
+            slot_mapping=slots,
+        )
 
     def exec_kv(
         self,
@@ -898,6 +931,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
         kv_no_split = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
         cache_mode = "PA"
+        output_kv_caches = self._resolve_kv_rmsnorm_rope_caches(
+            kv_cache,
+            kv_no_split,
+            is_output_kv=True,
+        )
 
         if self.enable_dsa_cp:
             _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
@@ -906,8 +944,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 cos,
                 sin,
                 slots.to(torch.int64),
-                kv_cache[1],
-                kv_cache[0],
+                output_kv_caches[0],
+                output_kv_caches[1],
                 epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
                 cache_mode=cache_mode,
                 is_output_kv=True,
@@ -920,8 +958,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 cos,
                 sin,
                 slots.to(torch.int64),
-                kv_cache[1],
-                kv_cache[0],
+                output_kv_caches[0],
+                output_kv_caches[1],
                 epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
                 cache_mode=cache_mode,
                 is_output_kv=True,

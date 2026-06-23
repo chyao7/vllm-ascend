@@ -3,9 +3,34 @@
 ROOT_DIR=$1
 SOC_VERSION=$2
 : "${ROOT_DIR:?ROOT_DIR is not set}"
+ROOT_DIR=$(cd "${ROOT_DIR}" && pwd)
 
 log() {
     echo "[build_aclnn] $*"
+}
+
+ensure_catlass() {
+    git config --global --add safe.directory "$ROOT_DIR"
+    CATLASS_PATH=${ROOT_DIR}/csrc/third_party/catlass/include
+    CATLASS_COMMIT=$(git config -f "${ROOT_DIR}/.gitmodules" --get submodule.csrc/third_party/catlass.commit)
+    if [[ ! -d "${CATLASS_PATH}" ]]; then
+        echo "dependency catlass is missing, try to fetch it..."
+        if ! git -C "${ROOT_DIR}" submodule sync --recursive; then
+            echo "submodule sync failed"
+            exit 1
+        fi
+        if ! git -C "${ROOT_DIR}" submodule update --init --recursive csrc/third_party/catlass; then
+            echo "fetch failed"
+            exit 1
+        fi
+        cd "${ROOT_DIR}/csrc/third_party/catlass" || exit 1
+        git fetch origin
+        git checkout "${CATLASS_COMMIT}" || exit 1
+        cd - || exit 1
+    fi
+    ABSOLUTE_CATLASS_PATH=$(cd "${CATLASS_PATH}" && pwd)
+    export CPATH="${ABSOLUTE_CATLASS_PATH}${CPATH:+:${CPATH}}"
+    log "catlass include=${ABSOLUTE_CATLASS_PATH}"
 }
 
 resolve_op_dir() {
@@ -64,24 +89,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
     log "matched SOC branch: ascend910b"
     # ASCEND910B (A2) series
     # dependency: catlass
-    git config --global --add safe.directory "$ROOT_DIR"
-    CATLASS_PATH=${ROOT_DIR}/csrc/third_party/catlass/include
-    CATLASS_COMMIT=$(git config -f "${ROOT_DIR}/.gitmodules" --get submodule.csrc/third_party/catlass.commit)
-    if [[ ! -d "${CATLASS_PATH}" ]]; then
-        echo "dependency catlass is missing, try to fetch it..."
-        git submodule sync
-        if ! git submodule update --init --recursive; then
-            echo "fetch failed"
-            exit 1
-        fi
-        cd "${ROOT_DIR}/csrc/third_party/catlass" || exit 1
-        git fetch origin
-        git checkout "${CATLASS_COMMIT}" || exit 1
-        cd - || exit 1
-    fi
-    ABSOLUTE_CATLASS_PATH=$(cd "${CATLASS_PATH}" && pwd)
-    export CPATH="${ABSOLUTE_CATLASS_PATH}${CPATH:+:${CPATH}}"
-    log "catlass include=${ABSOLUTE_CATLASS_PATH}"
+    ensure_catlass
 
     CUSTOM_OPS_ARRAY=(
         "scatter_nd_update_v2"
@@ -89,6 +97,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "grouped_matmul_swiglu_quant_weight_nz_tensor_list"
         "lightning_indexer"
         "sparse_flash_attention"
+        "int8_sparse_flash_attention"
         "matmul_allreduce_add_rmsnorm"
         "moe_init_routing_custom"
         "moe_gating_top_k"
@@ -129,21 +138,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
     log "matched SOC branch: ascend910_93"
     # ASCEND910C (A3) series
     # dependency: catlass
-    git config --global --add safe.directory "$ROOT_DIR"
-    CATLASS_PATH=${ROOT_DIR}/csrc/third_party/catlass/include
-    CATLASS_COMMIT=$(git config -f "${ROOT_DIR}/.gitmodules" --get submodule.csrc/third_party/catlass.commit)
-    if [[ ! -d "${CATLASS_PATH}" ]]; then
-        echo "dependency catlass is missing, try to fetch it..."
-        git submodule sync
-        if ! git submodule update --init --recursive; then
-            echo "fetch failed"
-            exit 1
-        fi
-        cd "${ROOT_DIR}/csrc/third_party/catlass" || exit 1
-        git fetch origin
-        git checkout "${CATLASS_COMMIT}" || exit 1
-        cd - || exit 1
-    fi
+    ensure_catlass
     CUSTOM_OPS_ARRAY=(
         "scatter_nd_update_v2"
         "grouped_matmul_swiglu_quant_weight_nz_tensor_list"
@@ -192,24 +187,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
     log "matched SOC branch: ascend950"
     # ASCEND950 (A5) series
     # dependency: catlass
-    git config --global --add safe.directory "$ROOT_DIR"
-    CATLASS_PATH=${ROOT_DIR}/csrc/third_party/catlass/include
-    CATLASS_COMMIT=$(git config -f "${ROOT_DIR}/.gitmodules" --get submodule.csrc/third_party/catlass.commit)
-    if [[ ! -d "${CATLASS_PATH}" ]]; then
-        echo "dependency catlass is missing, try to fetch it..."
-        git submodule sync
-        if ! git submodule update --init --recursive; then
-            echo "fetch failed"
-            exit 1
-        fi
-        cd "${ROOT_DIR}/csrc/third_party/catlass" || exit 1
-        git fetch origin
-        git checkout "${CATLASS_COMMIT}" || exit 1
-        cd - || exit 1
-    fi
-    ABSOLUTE_CATLASS_PATH=$(cd "${CATLASS_PATH}" && pwd)
-    export CPATH="${ABSOLUTE_CATLASS_PATH}${CPATH:+:${CPATH}}"
-    log "catlass include=${ABSOLUTE_CATLASS_PATH}"
+    ensure_catlass
 
     CUSTOM_OPS_ARRAY=(
         "moe_gating_top_k_hash"
