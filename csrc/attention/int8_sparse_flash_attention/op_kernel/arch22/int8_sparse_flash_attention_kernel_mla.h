@@ -226,10 +226,7 @@ template <typename SFAT> __aicore__ inline void Int8SparseFlashAttentionMla<SFAT
     constInfo.nextTokens = tilingData->baseParams.nextTokens;
     constInfo.attentionMode = tilingData->baseParams.attentionMode;
     constInfo.returnSoftmaxLse = tilingData->baseParams.returnSoftmaxLse;
-    constInfo.kvDequantScale = tilingData->baseParams.kvDequantScale;
-    constInfo.kvDequantOffset = tilingData->baseParams.kvDequantOffset;
     constInfo.kvStorageDim = tilingData->baseParams.kvStorageDim;
-    constInfo.keyQuantMode = tilingData->baseParams.keyQuantMode;
 
     constInfo.preLoadNum = PRELOAD_NUM;
     constInfo.nBufferMBaseSize = N_BUFFER_M_BASIC_SIZE;

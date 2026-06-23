@@ -190,10 +190,7 @@ struct ConstInfo {
     // sparse attr
     int64_t sparseBlockSize = 0;
     uint32_t sparseBlockCount = 0;
-    float kvDequantScale = 1.0F;
-    float kvDequantOffset = 0.0F;
     uint64_t kvStorageDim = 512ULL;
-    uint32_t keyQuantMode = 0U;
 };
 
 struct MSplitInfo {

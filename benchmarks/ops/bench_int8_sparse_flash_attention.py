@@ -7,18 +7,12 @@ Targets ``csrc/attention/int8_sparse_flash_attention`` (910B only):
   - **bf16 baseline**: ``torch.ops._C_ascend.npu_sparse_flash_attention``
   - **int8**: ``torch.ops._C_ascend.npu_int8_sparse_flash_attention``
 
-KV nope supports two layouts (kernel auto-detects via ``key.shape[-1]``):
-  - **packed** (default, 910B sparse C8): D=528 = 512 int8 + 4 fp32 per-tile scales
-  - **global**: D=512 int8 with ``key_scale`` / ``key_offset`` dequant
-
-Rope (D=64) stays bf16/fp16 in both modes. Shapes follow production SFA
-(TND query, PA_BSND KV, index_topk=2048).
+KV nope uses packed 910B sparse C8 layout: D=528 = 512 int8 + 4 fp32 per-tile scales.
+Rope (D=64) stays bf16/fp16. Shapes follow production SFA (TND query, PA_BSND KV).
 
 Example:
   python benchmarks/ops/bench_int8_sparse_flash_attention.py --scenario decode
-  python benchmarks/ops/bench_int8_sparse_flash_attention.py --quant-mode packed --grid
-  python benchmarks/ops/bench_int8_sparse_flash_attention.py --quant-mode global --accuracy-only
-  python benchmarks/ops/bench_int8_sparse_flash_attention.py --quant-mode both --scenario all
+  python benchmarks/ops/bench_int8_sparse_flash_attention.py --scenario all --grid
 """
 
 from __future__ import annotations
@@ -85,10 +79,6 @@ class LatencyResult:
 @dataclass
 class AccuracyResult:
     case: str
-    quant_mode: str
-    kv_storage_dim: int
-    key_scale: float
-    key_offset: float
     max_abs_err: float
     mean_abs_err: float
     max_sig_rel_err: float
@@ -112,10 +102,6 @@ class PreparedCase:
     cum_query_lens: torch.Tensor
     seq_lens: torch.Tensor
     scale: float
-    key_scale: float
-    key_offset: float
-    quant_mode: str
-    kv_storage_dim: int
     q_tokens: int
     kv_tokens: int
 
@@ -149,29 +135,6 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--block-size", type=int, default=DEEPSEEK_V32_SFA["block_size"])
     parser.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
-    parser.add_argument(
-        "--key-scale",
-        type=float,
-        default=0.0,
-        help="Global KV dequant scale; 0 means auto from bf16 KV max abs",
-    )
-    parser.add_argument(
-        "--key-offset",
-        type=float,
-        default=0.0,
-        help="Global KV dequant offset (default 0, symmetric quant)",
-    )
-    parser.add_argument(
-        "--quant-mode",
-        choices=["packed", "global", "both"],
-        default="packed",
-        help="KV nope layout: packed (D=528, 910B C8 default), global (D=512), or both",
-    )
-    parser.add_argument(
-        "--packed",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument(
@@ -190,22 +153,13 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _resolve_quant_modes(args: argparse.Namespace) -> list[str]:
-    if args.packed:
-        return ["packed"]
-    if args.quant_mode == "both":
-        return ["packed", "global"]
-    return [args.quant_mode]
-
-
-def _build_cases(args: argparse.Namespace) -> list[tuple[BenchCase, str]]:
-    quant_modes = _resolve_quant_modes(args)
-    base_cases: list[BenchCase] = []
+def _build_cases(args: argparse.Namespace) -> list[BenchCase]:
+    cases: list[BenchCase] = []
     if args.scenario in {"decode", "all"}:
         if args.grid or args.scenario == "all":
             for bs in (1, 4, 8):
                 for kv in (4096, 8192, 16384):
-                    base_cases.append(
+                    cases.append(
                         BenchCase(
                             name=f"decode_bs{bs}_kv{kv}",
                             batch_size=bs,
@@ -214,7 +168,7 @@ def _build_cases(args: argparse.Namespace) -> list[tuple[BenchCase, str]]:
                         )
                     )
         else:
-            base_cases.append(
+            cases.append(
                 BenchCase(
                     name=f"decode_bs{args.batch_size}_kv{args.seq_kv}",
                     batch_size=args.batch_size,
@@ -226,7 +180,7 @@ def _build_cases(args: argparse.Namespace) -> list[tuple[BenchCase, str]]:
         if args.grid or args.scenario == "all":
             for bs in (1, 4):
                 for sq in (128, 512):
-                    base_cases.append(
+                    cases.append(
                         BenchCase(
                             name=f"prefill_bs{bs}_sq{sq}_kv{args.seq_kv}",
                             batch_size=bs,
@@ -235,31 +189,12 @@ def _build_cases(args: argparse.Namespace) -> list[tuple[BenchCase, str]]:
                         )
                     )
         else:
-            base_cases.append(
+            cases.append(
                 BenchCase(
                     name=f"prefill_bs{args.batch_size}_sq{args.seq_q}_kv{args.seq_kv}",
                     batch_size=args.batch_size,
                     seq_q=args.seq_q,
                     seq_kv=args.seq_kv,
-                )
-            )
-
-    cases: list[tuple[BenchCase, str]] = []
-    for case in base_cases:
-        for quant_mode in quant_modes:
-            if len(quant_modes) == 1:
-                case_name = case.name
-            else:
-                case_name = f"{case.name}_{quant_mode}"
-            cases.append(
-                (
-                    BenchCase(
-                        name=case_name,
-                        batch_size=case.batch_size,
-                        seq_q=case.seq_q,
-                        seq_kv=case.seq_kv,
-                    ),
-                    quant_mode,
                 )
             )
     return cases
@@ -323,24 +258,10 @@ def _quantize_kv_packed_per_tile(kv_bf16: torch.Tensor) -> torch.Tensor:
     return packed.view(*prefix, K_NOPE_PACKED_BYTES)
 
 
-def _quantize_kv_int8(
-    kv_bf16: torch.Tensor,
-    key_scale: float,
-    key_offset: float,
-) -> tuple[torch.Tensor, float, float]:
-    """Symmetric global int8 quant: kv_dequant = int8 * scale + offset."""
-    if key_scale <= 0.0:
-        max_abs = float(kv_bf16.abs().max())
-        key_scale = max_abs / 127.0 if max_abs > 0.0 else 1.0
-    kv_int8 = torch.round((kv_bf16 - key_offset) / key_scale).clamp(-128, 127).to(torch.int8)
-    return kv_int8, key_scale, key_offset
-
-
 def _prepare_case(
     case: BenchCase,
     args: argparse.Namespace,
     device: torch.device,
-    quant_mode: str,
 ) -> PreparedCase:
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     n_heads = args.num_heads_q
@@ -359,26 +280,12 @@ def _prepare_case(
 
     block_table, block_num = _make_block_table(b, s_kv, block_size, device)
     k_nope_bf16 = torch.randn(block_num, block_size, 1, kv_lora_rank, dtype=dtype, device=device)
-    if quant_mode == "packed":
-        k_nope_int8 = _quantize_kv_packed_per_tile(k_nope_bf16)
-        key_scale, key_offset = 1.0, 0.0
-        kv_storage_dim = K_NOPE_PACKED_BYTES
-    elif quant_mode == "global":
-        k_nope_int8, key_scale, key_offset = _quantize_kv_int8(
-            k_nope_bf16,
-            key_scale=args.key_scale,
-            key_offset=args.key_offset,
-        )
-        kv_storage_dim = kv_lora_rank
-    else:
-        raise ValueError(f"unsupported quant_mode: {quant_mode}")
-
+    k_nope_int8 = _quantize_kv_packed_per_tile(k_nope_bf16)
     if k_nope_int8.dtype != torch.int8:
         raise TypeError(f"int8 KV must be torch.int8, got {k_nope_int8.dtype}")
-    if k_nope_int8.shape[-1] != kv_storage_dim:
+    if k_nope_int8.shape[-1] != K_NOPE_PACKED_BYTES:
         raise ValueError(
-            f"int8 KV last dim must be {kv_storage_dim} for {quant_mode} mode, "
-            f"got {k_nope_int8.shape[-1]}"
+            f"int8 KV last dim must be {K_NOPE_PACKED_BYTES}, got {k_nope_int8.shape[-1]}"
         )
     k_rope_cache = torch.randn(block_num, block_size, 1, rope_dim, dtype=dtype, device=device)
     sparse_indices = _make_sparse_indices(b, s_q, s_kv, sparse_count, device)
@@ -401,10 +308,6 @@ def _prepare_case(
         cum_query_lens=cum_query_lens,
         seq_lens=seq_lens,
         scale=scale,
-        key_scale=key_scale,
-        key_offset=key_offset,
-        quant_mode=quant_mode,
-        kv_storage_dim=kv_storage_dim,
         q_tokens=total_q,
         kv_tokens=b * s_kv,
     )
@@ -445,8 +348,8 @@ def _run_int8_sfa(prepared: PreparedCase) -> torch.Tensor:
         actual_seq_lengths_kv=prepared.seq_lens,
         query_rope=prepared.q_pe,
         key_rope=prepared.k_rope_cache,
-        key_scale=prepared.key_scale,
-        key_offset=prepared.key_offset,
+        key_scale=1.0,
+        key_offset=0.0,
         sparse_block_size=DEEPSEEK_V32_SFA["sparse_block_size"],
         layout_query=DEEPSEEK_V32_SFA["layout_query"],
         layout_kv=DEEPSEEK_V32_SFA["layout_kv"],
@@ -504,24 +407,23 @@ def _compute_accuracy(
     return max_abs_err, mean_abs_err, max_sig_rel_err, mean_sig_rel_err, max_rel_err_sig, cosine_sim
 
 
-def _print_header(device_type: AscendDeviceType, quant_modes: list[str]) -> None:
-    print("=" * 110)
+def _print_header(device_type: AscendDeviceType) -> None:
+    print("=" * 100)
     print("DeepSeek-V3.2 Int8 vs BF16 Sparse Flash Attention")
     print("  op source    : csrc/attention/int8_sparse_flash_attention")
     print(f"  device_type  : {device_type.name}")
     print("  bf16 op      : npu_sparse_flash_attention")
-    print("  int8 op      : npu_int8_sparse_flash_attention (910B)")
+    print("  int8 op      : npu_int8_sparse_flash_attention (910B packed D=528)")
     print(f"  kv_lora_rank : {DEEPSEEK_V32_SFA['kv_lora_rank']}")
     print(f"  rope_dim     : {DEEPSEEK_V32_SFA['qk_rope_head_dim']}")
     print(f"  index_topk   : {DEEPSEEK_V32_SFA['index_topk']}")
-    print(f"  quant_modes  : {', '.join(quant_modes)}")
-    print("=" * 110)
+    print("=" * 100)
 
 
 def _print_accuracy_header() -> None:
     print(
-        f"{'case':<34} {'mode':<7} {'D':>4} {'max_abs':>10} {'mean_abs':>10} {'max_rel%':>9} "
-        f"{'cos_sim':>8} {'scale':>10} {'bf16_ms':>9} {'int8_ms':>9} {'speedup':>8}"
+        f"{'case':<28} {'max_abs':>10} {'mean_abs':>10} {'max_rel%':>9} "
+        f"{'cos_sim':>8} {'bf16_ms':>9} {'int8_ms':>9} {'speedup':>8}"
     )
     print("-" * 100)
 
@@ -564,9 +466,8 @@ def main() -> int:
     run_accuracy = not args.benchmark_only
     run_benchmark = not args.accuracy_only
 
-    quant_modes = _resolve_quant_modes(args)
     cases = _build_cases(args)
-    _print_header(device_type, quant_modes)
+    _print_header(device_type)
 
     accuracy_results: list[AccuracyResult] = []
     latency_results: list[LatencyResult] = []
@@ -574,9 +475,9 @@ def main() -> int:
     if run_accuracy:
         _print_accuracy_header()
 
-    for case, quant_mode in cases:
+    for case in cases:
         try:
-            prepared = _prepare_case(case, args, device, quant_mode)
+            prepared = _prepare_case(case, args, device)
 
             with torch.no_grad():
                 bf16_out = _run_bf16_sfa(prepared)
@@ -602,10 +503,6 @@ def main() -> int:
 
                 acc = AccuracyResult(
                     case=case.name,
-                    quant_mode=prepared.quant_mode,
-                    kv_storage_dim=prepared.kv_storage_dim,
-                    key_scale=prepared.key_scale,
-                    key_offset=prepared.key_offset,
                     max_abs_err=max_abs_err,
                     mean_abs_err=mean_abs_err,
                     max_sig_rel_err=max_sig_rel_err,
@@ -618,10 +515,8 @@ def main() -> int:
                 )
                 accuracy_results.append(acc)
                 print(
-                    f"{acc.case:<34} {acc.quant_mode:<7} {acc.kv_storage_dim:>4} "
-                    f"{acc.max_abs_err:>10.4e} {acc.mean_abs_err:>10.4e} "
+                    f"{acc.case:<28} {acc.max_abs_err:>10.4e} {acc.mean_abs_err:>10.4e} "
                     f"{acc.max_sig_rel_err * 100:>8.3f}% {acc.cosine_sim:>8.6f} "
-                    f"{acc.key_scale:>10.4e} "
                     f"{acc.bf16_latency_ms:>9.3f} {acc.int8_latency_ms:>9.3f} {acc.speedup:>8.2f}x"
                 )
 
@@ -683,7 +578,7 @@ def main() -> int:
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "device_type": device_type.name,
             "op_source": "csrc/attention/int8_sparse_flash_attention",
-            "quant_modes": quant_modes,
+            "kv_storage_dim": K_NOPE_PACKED_BYTES,
             "config": DEEPSEEK_V32_SFA,
             "args": vars(args),
             "accuracy": [asdict(r) for r in accuracy_results],

@@ -361,8 +361,6 @@ void SFAMlaTiling::FillTilingBaseParamsMla()
     tilingData_.baseParams.set_blockSize(sfaInfo_->blockSize);
     tilingData_.baseParams.set_maxBlockNumPerBatch(sfaInfo_->maxBlockNumPerBatch);
     tilingData_.baseParams.set_scaleValue(sfaInfo_->scaleValue);
-    tilingData_.baseParams.set_kvDequantScale(sfaInfo_->kvDequantScale);
-    tilingData_.baseParams.set_kvDequantOffset(sfaInfo_->kvDequantOffset);
     tilingData_.baseParams.set_nNumOfQInOneGroup(sfaInfo_->n1Size / sfaInfo_->n2Size);
     tilingData_.baseParams.set_actualLenDimsQ(sfaInfo_->actualLenDimsQ);
     tilingData_.baseParams.set_actualLenDimsKV(sfaInfo_->actualLenDimsKV);
@@ -377,7 +375,6 @@ void SFAMlaTiling::FillTilingBaseParamsMla()
     tilingData_.baseParams.set_isActualLenDimsNull(sfaInfo_->actualQSeqLenFlag ? 0U : 1U);
     tilingData_.baseParams.set_isActualLenDimsKVNull(sfaInfo_->actualSeqLenFlag ? 0U : 1U);
     tilingData_.baseParams.set_kvStorageDim(sfaInfo_->kvStorageDim);
-    tilingData_.baseParams.set_keyQuantMode(sfaInfo_->keyQuantMode);
 }
 
 // for flash decode
@@ -1106,12 +1103,12 @@ ge::graphStatus SFATilingCheck::CheckVAndKRopeShapeForBatchContinuous()
     shapeParams.N = n2Size_;
     shapeParams.S = s2Size_;
     shapeParams.T = kvTSize_;
-    shapeParams.D = keyQuantMode_ != 0 ? kvStorageDim_ : qkHeadDim_;
+    shapeParams.D = kvStorageDim_;
     if (CompareShape(shapeParams, keyShapeCmp_, kvLayout_, KEY_NAME) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
 
-    shapeParams.D = keyQuantMode_ != 0 ? kvStorageDim_ : vHeadDim_;
+    shapeParams.D = kvStorageDim_;
     if (CompareShape(shapeParams, valueShapeCmp_, kvLayout_, VALUE_NAME) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
@@ -1149,13 +1146,13 @@ ge::graphStatus SFATilingCheck::CheckVAndKRopeShapeForPageAttention()
     shapeParams.Bn = blockNum;
     shapeParams.N = n2Size_;
     shapeParams.Bs = blockSize_;
-    shapeParams.D = keyQuantMode_ != 0 ? kvStorageDim_ : vHeadDim_;
+    shapeParams.D = kvStorageDim_;
     shapeParams.T = kvTSize_;
     if (CompareShape(shapeParams, valueShapeCmp_, kvLayout_, VALUE_NAME) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
 
-    shapeParams.D = keyQuantMode_ != 0 ? kvStorageDim_ : qkHeadDim_;
+    shapeParams.D = kvStorageDim_;
     if (CompareShape(shapeParams, keyShapeCmp_, kvLayout_, KEY_NAME) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
@@ -1335,18 +1332,12 @@ ge::graphStatus SFATilingCheck::CheckFeatureMlaNoQuantShape() const
         OP_LOGE(opName_, "qk_head_dim only support 512, but got %u", qkHeadDim_),
         return ge::GRAPH_FAILED);
 
-    if (keyQuantMode_ != 0) {
-        OP_CHECK_IF(kvStorageDim_ != 528,
-            OP_LOGE(opName_, "packed kv storage dim should be 528, but got %u", kvStorageDim_),
-            return ge::GRAPH_FAILED);
-        OP_CHECK_IF(vHeadDim_ != 528,
-            OP_LOGE(opName_, "packed value storage dim should be 528, but got %u", vHeadDim_),
-            return ge::GRAPH_FAILED);
-    } else {
-        OP_CHECK_IF(qkHeadDim_ != vHeadDim_,
-            OP_LOGE(opName_, "qk_head_dim[%u] should be equal to v_head_dim[%u]", qkHeadDim_, vHeadDim_),
-            return ge::GRAPH_FAILED);
-    }
+    OP_CHECK_IF(kvStorageDim_ != 528,
+        OP_LOGE(opName_, "packed kv storage dim should be 528, but got %u", kvStorageDim_),
+        return ge::GRAPH_FAILED);
+    OP_CHECK_IF(vHeadDim_ != 528,
+        OP_LOGE(opName_, "packed value storage dim should be 528, but got %u", vHeadDim_),
+        return ge::GRAPH_FAILED);
 
     OP_CHECK_IF(ropeHeadDim_ != 64,
         OP_LOGE(opName_, "rope_head_dim should be 64, but got %u", ropeHeadDim_),
@@ -1436,7 +1427,6 @@ void SFATilingCheck::Init()
     qkHeadDim_ = sfaInfo_.qkHeadDim;
     vHeadDim_ = sfaInfo_.vHeadDim;
     kvStorageDim_ = sfaInfo_.kvStorageDim;
-    keyQuantMode_ = sfaInfo_.keyQuantMode;
     ropeHeadDim_ = sfaInfo_.ropeHeadDim;
     maxBlockNumPerBatch_ = sfaInfo_.maxBlockNumPerBatch;
     qTSize_ = sfaInfo_.qTSize;
@@ -1552,10 +1542,6 @@ ge::graphStatus SFAInfoParser::CheckRequiredAttrExistence() const
     OP_CHECK_IF(opParamInfo_.sparseBlockSize == nullptr, OP_LOGE(opName_, "attr sparseBlockSize is nullptr"),
                return ge::GRAPH_FAILED);
     OP_CHECK_IF(opParamInfo_.scaleValue == nullptr, OP_LOGE(opName_, "attr scaleValue is nullptr"),
-               return ge::GRAPH_FAILED);
-    OP_CHECK_IF(opParamInfo_.kvDequantScale == nullptr, OP_LOGE(opName_, "attr key_scale is nullptr"),
-               return ge::GRAPH_FAILED);
-    OP_CHECK_IF(opParamInfo_.kvDequantOffset == nullptr, OP_LOGE(opName_, "attr key_offset is nullptr"),
                return ge::GRAPH_FAILED);
     OP_CHECK_IF(opParamInfo_.sparseMode == nullptr, OP_LOGE(opName_, "attr sparseMode is nullptr"),
                return ge::GRAPH_FAILED);
@@ -1879,7 +1865,6 @@ ge::graphStatus SFAInfoParser::GetValueHeadDim()
 ge::graphStatus SFAInfoParser::GetKvStorageDim()
 {
     kvStorageDim_ = GetAxisNum(keyShape_, SFAAxis::D, kvLayout_);
-    keyQuantMode_ = (kvStorageDim_ == 528U && qkHeadDim_ == 512U) ? 1U : 0U;
     return ge::GRAPH_SUCCESS;
 }
 
@@ -2007,10 +1992,7 @@ void SFAInfoParser::GenerateInfo(SFATilingInfo &sfaInfo)
 
     sfaInfo.totalBlockNum = opParamInfo_.key.shape->GetStorageShape().GetDim(0);
     sfaInfo.scaleValue = *opParamInfo_.scaleValue;
-    sfaInfo.kvDequantScale = *opParamInfo_.kvDequantScale;
-    sfaInfo.kvDequantOffset = *opParamInfo_.kvDequantOffset;
     sfaInfo.kvStorageDim = kvStorageDim_;
-    sfaInfo.keyQuantMode = keyQuantMode_;
     sfaInfo.pageAttentionFlag = (kvStorageMode_ == KvStorageMode::PAGE_ATTENTION);
     sfaInfo.blockSize = blockSize_;
     sfaInfo.blockTypeSize =  sizeof(float);

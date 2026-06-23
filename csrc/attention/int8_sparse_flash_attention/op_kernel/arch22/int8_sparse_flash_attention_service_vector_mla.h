@@ -74,8 +74,6 @@ public:
                                     int64_t realS2Idx2, const RunInfo &runInfo);
     __aicore__ inline void CopyOutMrgeResult(int64_t mte2Size, int64_t mte3Size, int64_t s2StartGmOffset,
                                              int64_t mergeMte3Idx, const RunInfo &runInfo);
-    __aicore__ inline void DequantInt8Row(LocalTensor<KV_T> &dstUb, LocalTensor<KV_INT8_T> srcInt8Ub, float scale,
-                                          float offset, uint32_t headDim);
     __aicore__ inline void DequantInt8RowPerTile(LocalTensor<KV_T> &dstUb, LocalTensor<KV_INT8_T> packedRowUb,
                                                  uint32_t headDim);
     __aicore__ inline void SetInfInBlk(const LocalTensor<T> &mmResUb, uint32_t dealRowCount, uint32_t columnCount,
@@ -132,9 +130,13 @@ public:
     // repeat stride不能超过256
     static constexpr uint32_t REPEATE_STRIDE_UP_BOUND = 256;
     static constexpr uint32_t KV_MERGE_STAGE_ROWS = 32U;
-    static constexpr uint32_t KV_MERGE_STAGE_MAX_DIM = 528U;
+    static constexpr uint32_t KV_PACKED_ROW_SIZE = 528U;
+    static constexpr uint32_t KV_MERGE_STAGE_MAX_DIM = 544U;
     static constexpr uint32_t KV_TILE_SIZE = 128U;
     static constexpr uint32_t KV_TILE_NUM = 4U;
+    static constexpr uint32_t DQ_ALIGNED_ROW_BYTES = 544U;
+    static constexpr uint32_t DQ_HALF_UB_OFFSET = DQ_ALIGNED_ROW_BYTES;
+    static constexpr uint32_t DQ_FP32_UB_OFFSET = DQ_ALIGNED_ROW_BYTES + KV_TILE_SIZE * static_cast<uint32_t>(sizeof(half));
     static constexpr bool PAGE_ATTENTION = SFAT::pageAttention;
     static constexpr int TEMPLATE_MODE = SFAT::templateMode;
     static constexpr bool FLASH_DECODE = SFAT::flashDecode;
@@ -880,32 +882,23 @@ __aicore__ inline int64_t SFAVectorService<SFAT>::GetKeyRopeGmOffset(int64_t rea
 }
 
 template <typename SFAT>
-__aicore__ inline void SFAVectorService<SFAT>::DequantInt8Row(LocalTensor<KV_T> &dstUb,
-                                                              LocalTensor<KV_INT8_T> srcInt8Ub, float scale,
-                                                              float offset, uint32_t headDim)
-{
-    // arch22 supports int8->half and half->float, but not int8->float directly.
-    LocalTensor<half> halfUb = tmpBuff1.Get<half>();
-    LocalTensor<float> fp32Ub = tmpBuff1.Get<float>()[headDim];
-    Cast(halfUb, srcInt8Ub, RoundMode::CAST_NONE, headDim);
-    Cast(fp32Ub, halfUb, RoundMode::CAST_NONE, headDim);
-    Muls(fp32Ub, fp32Ub, scale, headDim);
-    Adds(fp32Ub, fp32Ub, offset, headDim);
-    Cast(dstUb, fp32Ub, RoundMode::CAST_ROUND, headDim);
-}
-
-template <typename SFAT>
 __aicore__ inline void SFAVectorService<SFAT>::DequantInt8RowPerTile(LocalTensor<KV_T> &dstUb,
                                                                     LocalTensor<KV_INT8_T> packedRowUb,
                                                                     uint32_t headDim)
 {
-    LocalTensor<half> halfUb = tmpBuff1.Get<half>();
-    LocalTensor<float> fp32Ub = tmpBuff1.Get<float>()[KV_TILE_SIZE];
-    LocalTensor<float> scaleUb = packedRowUb[headDim].template ReinterpretCast<float>();
+    // kvMergUb_ rows are spaced by 528 bytes, so odd rows are only 16B-aligned and
+    // cannot be used directly by vector Cast/Muls. Copy to a 32B-aligned staging row first.
+    LocalTensor<KV_INT8_T> alignedRowUb =
+        tmpBuff1.GetWithOffset<KV_INT8_T>(KV_MERGE_STAGE_MAX_DIM, 0);
+    DataCopy(alignedRowUb, packedRowUb, KV_PACKED_ROW_SIZE);
+
+    LocalTensor<half> halfUb = tmpBuff1.GetWithOffset<half>(KV_TILE_SIZE, DQ_HALF_UB_OFFSET);
+    LocalTensor<float> fp32Ub = tmpBuff1.GetWithOffset<float>(KV_TILE_SIZE, DQ_FP32_UB_OFFSET);
+    LocalTensor<float> scaleUb = alignedRowUb[headDim].template ReinterpretCast<float>();
 
     for (uint32_t tileIdx = 0; tileIdx < KV_TILE_NUM; ++tileIdx) {
         uint32_t start = tileIdx * KV_TILE_SIZE;
-        LocalTensor<KV_INT8_T> tileInt8Ub = packedRowUb[start];
+        LocalTensor<KV_INT8_T> tileInt8Ub = alignedRowUb[start];
         Cast(halfUb, tileInt8Ub, RoundMode::CAST_NONE, KV_TILE_SIZE);
         Cast(fp32Ub, halfUb, RoundMode::CAST_NONE, KV_TILE_SIZE);
         float scale = scaleUb.GetValue(tileIdx);
@@ -925,7 +918,7 @@ SFAVectorService<SFAT>::CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int6
     int64_t validS2Count =
         (realS2Idx + constInfo.sparseBlockSize > s2IdLimit ? s2IdLimit - realS2Idx : constInfo.sparseBlockSize);
     const uint64_t kvGmStride = constInfo.kvStorageDim;
-    const uint64_t stageRowStride = constInfo.keyQuantMode != 0 ? constInfo.kvStorageDim : constInfo.headDim;
+    const uint64_t stageRowStride = constInfo.kvStorageDim;
     DataCopyExtParams intriParams;
     intriParams.blockLen = validS2Count * stageRowStride * sizeof(KV_INT8_T);
     intriParams.blockCount = 1;
@@ -986,7 +979,7 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInKv(int64_t &mte2Size, int64
         CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx2, keyOffset2, s2IdLimit, runInfo);
     } else {
         const uint64_t kvGmStride = constInfo.kvStorageDim;
-        const uint64_t stageRowStride = constInfo.keyQuantMode != 0 ? constInfo.kvStorageDim : constInfo.headDim;
+        const uint64_t stageRowStride = constInfo.kvStorageDim;
         DataCopyExtParams intriParams;
         intriParams.blockLen = constInfo.sparseBlockSize * stageRowStride * sizeof(KV_INT8_T);
         intriParams.blockCount = (keyOffset1 >= 0) + (keyOffset2 >= 0);
@@ -1024,17 +1017,11 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyOutMrgeResult(int64_t mte2Siz
     WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
 
     int64_t rowCount = mte2Size - mte3Size;
-    const float scale = constInfo.kvDequantScale;
-    const float offset = constInfo.kvDequantOffset;
-    const uint64_t stageRowStride = constInfo.keyQuantMode != 0 ? constInfo.kvStorageDim : constInfo.headDim;
+    const uint64_t stageRowStride = constInfo.kvStorageDim;
     for (int64_t rowIdx = 0; rowIdx < rowCount; ++rowIdx) {
         LocalTensor<KV_INT8_T> srcInt8RowUb =
             kvMergUb_[mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * KV_MERGE_STAGE_MAX_DIM + rowIdx * stageRowStride];
-        if (constInfo.keyQuantMode != 0) {
-            DequantInt8RowPerTile(dequantTmpUb_, srcInt8RowUb, constInfo.headDim);
-        } else {
-            DequantInt8Row(dequantTmpUb_, srcInt8RowUb, scale, offset, constInfo.headDim);
-        }
+        DequantInt8RowPerTile(dequantTmpUb_, srcInt8RowUb, constInfo.headDim);
         DataCopyExtParams rowCopyParams;
         rowCopyParams.blockCount = 1;
         rowCopyParams.blockLen = constInfo.headDim * sizeof(KV_T);

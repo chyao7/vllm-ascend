@@ -11,9 +11,7 @@
 /*!
  * \file int8_sparse_flash_attention_def.cpp
  * \brief Int8 KV sparse flash attention for Ascend 910B.
- *        KV nope dequant:
- *          - key_quant_mode=0 (default): kv_dequant = kv_int8 * key_scale + key_offset
- *          - packed layout (D=528): per-token 4x128 int8 tiles with fp32 scales at offset 512
+ *        KV nope uses packed int8 layout (D=528): 512 int8 + 4 fp32 per-tile scales.
  *        KV rope stays bf16/fp16 and is not quantized.
  */
 
@@ -90,8 +88,8 @@ public:
         this->Attr("next_tokens").AttrType(OPTIONAL).Int(INT64_MAX);
         this->Attr("attention_mode").AttrType(OPTIONAL).Int(2);
         this->Attr("return_softmax_lse").AttrType(OPTIONAL).Bool(false);
-        this->Attr("key_scale").AttrType(REQUIRED).Float(1.0);
-        this->Attr("key_offset").AttrType(REQUIRED).Float(0.0);
+        this->Attr("key_scale").AttrType(OPTIONAL).Float(1.0);
+        this->Attr("key_offset").AttrType(OPTIONAL).Float(0.0);
         OpAICoreConfig aicore_config;
         aicore_config.DynamicCompileStaticFlag(true)
             .DynamicFormatFlag(true)
