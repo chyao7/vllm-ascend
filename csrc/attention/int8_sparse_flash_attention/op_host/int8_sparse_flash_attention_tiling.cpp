@@ -1187,7 +1187,7 @@ ge::graphStatus SFATilingCheck::CheckVAndKRope()
     if (ge::GRAPH_SUCCESS != CheckDTypeConsistency(opParamInfo_.value.desc->GetDataType(),
         inputKvType_, VALUE_NAME) ||
         ge::GRAPH_SUCCESS != CheckDTypeConsistency(opParamInfo_.keyRope.desc->GetDataType(),
-        inputKvType_, KEY_ROPE_NAME) || ge::GRAPH_SUCCESS != CheckVAndKRopeShape()) {
+        inputQType_, KEY_ROPE_NAME) || ge::GRAPH_SUCCESS != CheckVAndKRopeShape()) {
         return ge::GRAPH_FAILED;
     }
     return ge::GRAPH_SUCCESS;
