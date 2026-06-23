@@ -520,7 +520,8 @@ class AdpBuilder(opdesc_parser.OpDesc):
         if attr_type == "bool":
             return str(attrval).capitalize()
         if attr_type == "str":
-            return '"' + str(attrval) + '"'
+            # Quotes are added in _attr_argpack; store the raw string value here.
+            return str(attrval).strip().strip('"')
         if attr_type == "float":
             return str(attrval).strip().strip('"').rstrip("f")
         if attr_type == "int":
