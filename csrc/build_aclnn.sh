@@ -252,16 +252,14 @@ invalidate_stale_opc_artifacts() {
     rm -rf "${dynamic_dir}"
     rm -f "${build_dir}/tbe/.impl_timestamp"
 
+    # ascendc_impl_build.py drives every generated *.py under binary/*/src; wipe all
+    # opc stamps and copied src trees so syntax fixes are not masked by stale artifacts.
     if [[ -d "${bin_gen}" ]]; then
-        rm -f "${bin_gen}"/grouped_matmul_swiglu_quant_"${SOC_ARG}"_*.done
-        rm -f "${bin_gen}"/grouped_matmul_swiglu_quant_v2_"${SOC_ARG}"_*.done
-        rm -f "${bin_gen}"/quant_lightning_indexer_"${SOC_ARG}"_*.done
+        rm -f "${bin_gen}"/*.done
     fi
 
     if [[ -d "${bin_src}" ]]; then
-        rm -rf "${bin_src}"/grouped_matmul_swiglu_quant
-        rm -rf "${bin_src}"/grouped_matmul_swiglu_quant_v2
-        rm -rf "${bin_src}"/quant_lightning_indexer
+        find "${bin_src}" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
     fi
 
     mkdir -p "${build_dir}"
