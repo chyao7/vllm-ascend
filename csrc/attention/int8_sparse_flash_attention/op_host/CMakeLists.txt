@@ -9,29 +9,6 @@
 # -----------------------------------------------------------------------------------------------------------
 add_op_to_compiled_list()
 
-if (BUILD_OPEN_PROJECT)
-    target_sources(op_host_aclnnInner PRIVATE
-        ${CMAKE_CURRENT_LIST_DIR}/int8_sparse_flash_attention_def.cpp
-    )
-endif()
-
-# Incremental builds may leave op_kernel as a symlink under build/binary/.../src/.
-# add_ops_src_copy runs cp before rm, which fails when source and destination are the same inode.
-if (BUILD_OPEN_PROJECT AND NOT BUILD_OPS_RTY_KERNEL)
-    __int8_sfa_verify_kernel_headers()
-    if (NOT DEFINED _INT8_SFA_SRC_COPY_FIXUP_DEFERRED)
-        set(_INT8_SFA_SRC_COPY_FIXUP_DEFERRED TRUE CACHE INTERNAL "")
-        cmake_language(DEFER CALL __int8_sfa_register_src_copy_fixup)
-    endif()
-    # AICPU_CUST_OBJ_TARGETS is CACHE INTERNAL and survives incremental configures.
-    # gen_cust_aicpu_kernel_symbol() runs after custom_build; prune stale entries before it.
-    if (NOT DEFINED _INT8_SFA_AICPU_CACHE_SANITIZE_DEFERRED)
-        set(_INT8_SFA_AICPU_CACHE_SANITIZE_DEFERRED TRUE CACHE INTERNAL "")
-        cmake_language(DEFER DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
-            CALL __int8_sfa_sanitize_stale_aicpu_cust_targets)
-    endif()
-endif()
-
 function(__int8_sfa_sanitize_stale_aicpu_cust_targets)
     if (NOT DEFINED AICPU_CUST_OBJ_TARGETS OR AICPU_CUST_OBJ_TARGETS STREQUAL "")
         return()
@@ -162,6 +139,29 @@ function(__int8_sfa_invalidate_build_cache _cu _src_dst)
         message(STATUS "int8_sparse_flash_attention: removed stale ${_meta_dir}")
     endforeach()
 endfunction()
+
+if (BUILD_OPEN_PROJECT)
+    target_sources(op_host_aclnnInner PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}/int8_sparse_flash_attention_def.cpp
+    )
+endif()
+
+# Incremental builds may leave op_kernel as a symlink under build/binary/.../src/.
+# add_ops_src_copy runs cp before rm, which fails when source and destination are the same inode.
+if (BUILD_OPEN_PROJECT AND NOT BUILD_OPS_RTY_KERNEL)
+    __int8_sfa_verify_kernel_headers()
+    if (NOT DEFINED _INT8_SFA_SRC_COPY_FIXUP_DEFERRED)
+        set(_INT8_SFA_SRC_COPY_FIXUP_DEFERRED TRUE CACHE INTERNAL "")
+        cmake_language(DEFER CALL __int8_sfa_register_src_copy_fixup)
+    endif()
+    # AICPU_CUST_OBJ_TARGETS is CACHE INTERNAL and survives incremental configures.
+    # gen_cust_aicpu_kernel_symbol() runs after custom_build; prune stale entries before it.
+    if (NOT DEFINED _INT8_SFA_AICPU_CACHE_SANITIZE_DEFERRED)
+        set(_INT8_SFA_AICPU_CACHE_SANITIZE_DEFERRED TRUE CACHE INTERNAL "")
+        cmake_language(DEFER DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+            CALL __int8_sfa_sanitize_stale_aicpu_cust_targets)
+    endif()
+endif()
 
 add_ops_compile_options(
     OP_NAME Int8SparseFlashAttention
