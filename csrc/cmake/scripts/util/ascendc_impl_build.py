@@ -532,11 +532,21 @@ class AdpBuilder(opdesc_parser.OpDesc):
         for attr in self.attr_list:
             attr_type = self.attr_val.get(attr).get("type")
             if attr_type == "float":
-                lines.append(f"        if {attr} is not None and isinstance({attr}, str):")
-                lines.append(f"            {attr} = float({attr})")
+                lines.append(
+                    f"        if bound.arguments.get('{attr}') is not None "
+                    f"and isinstance(bound.arguments['{attr}'], str):"
+                )
+                lines.append(
+                    f"            bound.arguments['{attr}'] = float(bound.arguments['{attr}'])"
+                )
             elif attr_type == "int":
-                lines.append(f"        if {attr} is not None and isinstance({attr}, str):")
-                lines.append(f"            {attr} = int({attr})")
+                lines.append(
+                    f"        if bound.arguments.get('{attr}') is not None "
+                    f"and isinstance(bound.arguments['{attr}'], str):"
+                )
+                lines.append(
+                    f"            bound.arguments['{attr}'] = int(bound.arguments['{attr}'])"
+                )
         return "\n".join(lines) if lines else "        pass"
 
     def _build_paradefault(self: any):

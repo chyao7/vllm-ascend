@@ -223,6 +223,51 @@ fi
 
 log_selected_ops
 
+invalidate_stale_opc_artifacts() {
+    local generator="${ROOT_DIR}/csrc/cmake/scripts/util/ascendc_impl_build.py"
+    local build_dir="${ROOT_DIR}/csrc/build"
+    local stamp="${build_dir}/.ascendc_opc_stamp"
+    local dynamic_dir="${build_dir}/tbe/dynamic"
+    local bin_gen="${build_dir}/binary/${SOC_ARG}/gen"
+    local bin_src="${build_dir}/binary/${SOC_ARG}/src"
+    local needs_invalidate=0
+
+    if [[ ! -f "${generator}" ]]; then
+        return 0
+    fi
+
+    if [[ ! -f "${stamp}" ]]; then
+        needs_invalidate=1
+    elif [[ "${generator}" -nt "${stamp}" ]]; then
+        needs_invalidate=1
+    elif find "${ROOT_DIR}/csrc" -path '*/op_host/*_def.cpp' -newer "${stamp}" -print -quit | grep -q .; then
+        needs_invalidate=1
+    fi
+
+    if [[ "${needs_invalidate}" -eq 0 ]]; then
+        return 0
+    fi
+
+    log "invalidating stale TBE/opc artifacts (generator or op def changed)"
+    rm -rf "${dynamic_dir}"
+    rm -f "${build_dir}/tbe/.impl_timestamp"
+
+    if [[ -d "${bin_gen}" ]]; then
+        rm -f "${bin_gen}"/grouped_matmul_swiglu_quant_"${SOC_ARG}"_*.done
+        rm -f "${bin_gen}"/grouped_matmul_swiglu_quant_v2_"${SOC_ARG}"_*.done
+        rm -f "${bin_gen}"/quant_lightning_indexer_"${SOC_ARG}"_*.done
+    fi
+
+    if [[ -d "${bin_src}" ]]; then
+        rm -rf "${bin_src}"/grouped_matmul_swiglu_quant
+        rm -rf "${bin_src}"/grouped_matmul_swiglu_quant_v2
+        rm -rf "${bin_src}"/quant_lightning_indexer
+    fi
+
+    mkdir -p "${build_dir}"
+    touch "${stamp}"
+}
+
 
 # # build custom ops
 # cd csrc
@@ -248,6 +293,8 @@ log_selected_ops
   : "${CUSTOM_OPS:?CUSTOM_OPS is not set}"
   : "${SOC_VERSION:?SOC_VERSION is not set}"
   : "${SOC_ARG:?SOC_ARG is not set}"
+
+  invalidate_stale_opc_artifacts
 
   log "build command: bash build.sh --pkg --ops=\"${CUSTOM_OPS}\" --soc=\"${SOC_ARG}\""
   log "building custom ops ${CUSTOM_OPS} for ${SOC_VERSION}"
