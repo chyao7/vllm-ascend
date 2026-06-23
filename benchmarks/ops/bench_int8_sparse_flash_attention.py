@@ -35,6 +35,7 @@ import vllm_ascend.platform  # noqa: F401
 from vllm_ascend.attention.sfa_k_nope_pack import (
     K_NOPE_INT8_DIM,
     K_NOPE_PACKED_BYTES,
+    dequantize_packed_k_nope,
     quantize_k_nope_per_group,
 )
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
@@ -85,6 +86,8 @@ class AccuracyResult:
     mean_sig_rel_err: float
     max_rel_err_sig: float
     cosine_sim: float
+    dequant_max_sig_rel_err: float
+    dequant_cosine_sim: float
     bf16_latency_ms: float
     int8_latency_ms: float
     speedup: float
@@ -335,6 +338,32 @@ def _run_bf16_sfa(prepared: PreparedCase) -> torch.Tensor:
     return out
 
 
+def _run_bf16_sfa_dequant_baseline(prepared: PreparedCase) -> torch.Tensor:
+    """BF16 SFA with Python-side dequantized packed KV (fair int8 accuracy baseline)."""
+    attn_metadata = SimpleNamespace(block_table=prepared.block_table)
+    k_dequant = dequantize_packed_k_nope(prepared.k_nope_int8.view(torch.uint8)).to(
+        prepared.k_nope_bf16.dtype
+    )
+    out, _, _ = torch.ops._C_ascend.npu_sparse_flash_attention(
+        query=prepared.ql_nope,
+        key=k_dequant,
+        value=k_dequant,
+        sparse_indices=prepared.sparse_indices,
+        scale_value=prepared.scale,
+        sparse_block_size=DEEPSEEK_V32_SFA["sparse_block_size"],
+        block_table=attn_metadata.block_table,
+        actual_seq_lengths_query=prepared.cum_query_lens,
+        actual_seq_lengths_kv=prepared.seq_lens,
+        query_rope=prepared.q_pe,
+        key_rope=prepared.k_rope_cache,
+        layout_query=DEEPSEEK_V32_SFA["layout_query"],
+        layout_kv=DEEPSEEK_V32_SFA["layout_kv"],
+        sparse_mode=DEEPSEEK_V32_SFA["sparse_mode"],
+        attention_mode=DEEPSEEK_V32_SFA["attention_mode"],
+    )
+    return out
+
+
 def _run_int8_sfa(prepared: PreparedCase) -> torch.Tensor:
     attn_metadata = SimpleNamespace(block_table=prepared.block_table)
     out, _, _ = torch.ops._C_ascend.npu_int8_sparse_flash_attention(
@@ -423,9 +452,10 @@ def _print_header(device_type: AscendDeviceType) -> None:
 def _print_accuracy_header() -> None:
     print(
         f"{'case':<28} {'max_abs':>10} {'mean_abs':>10} {'max_rel%':>9} "
-        f"{'cos_sim':>8} {'bf16_ms':>9} {'int8_ms':>9} {'speedup':>8}"
+        f"{'cos_sim':>8} {'dq_rel%':>8} {'dq_cos':>7} "
+        f"{'bf16_ms':>9} {'int8_ms':>9} {'speedup':>8}"
     )
-    print("-" * 100)
+    print("-" * 118)
 
 
 def _print_latency_header() -> None:
@@ -481,6 +511,7 @@ def main() -> int:
 
             with torch.no_grad():
                 bf16_out = _run_bf16_sfa(prepared)
+                dequant_bf16_out = _run_bf16_sfa_dequant_baseline(prepared)
                 int8_out = _run_int8_sfa(prepared)
 
             if run_accuracy:
@@ -492,6 +523,14 @@ def main() -> int:
                     max_rel_err_sig,
                     cosine_sim,
                 ) = _compute_accuracy(bf16_out, int8_out)
+                (
+                    _,
+                    _,
+                    dequant_max_sig_rel_err,
+                    _,
+                    _,
+                    dequant_cosine_sim,
+                ) = _compute_accuracy(dequant_bf16_out, int8_out)
 
                 bf16_ms = 0.0
                 int8_ms = 0.0
@@ -509,6 +548,8 @@ def main() -> int:
                     mean_sig_rel_err=mean_sig_rel_err,
                     max_rel_err_sig=max_rel_err_sig,
                     cosine_sim=cosine_sim,
+                    dequant_max_sig_rel_err=dequant_max_sig_rel_err,
+                    dequant_cosine_sim=dequant_cosine_sim,
                     bf16_latency_ms=bf16_ms,
                     int8_latency_ms=int8_ms,
                     speedup=speedup,
@@ -517,6 +558,7 @@ def main() -> int:
                 print(
                     f"{acc.case:<28} {acc.max_abs_err:>10.4e} {acc.mean_abs_err:>10.4e} "
                     f"{acc.max_sig_rel_err * 100:>8.3f}% {acc.cosine_sim:>8.6f} "
+                    f"{acc.dequant_max_sig_rel_err * 100:>7.3f}% {acc.dequant_cosine_sim:>7.6f} "
                     f"{acc.bf16_latency_ms:>9.3f} {acc.int8_latency_ms:>9.3f} {acc.speedup:>8.2f}x"
                 )
 
@@ -550,22 +592,28 @@ def main() -> int:
                 f"{result.q_tokens_per_s:>14.1f} {result.q_tokens:>10}"
             )
 
-    print("-" * 100)
+    print("-" * 118)
     if not accuracy_results and not latency_results:
         print("No results collected.", file=sys.stderr)
         return 2
 
     if accuracy_results:
         worst = max(accuracy_results, key=lambda r: r.max_sig_rel_err)
+        worst_dequant = min(accuracy_results, key=lambda r: r.dequant_cosine_sim)
         best_speed = max(
             (r for r in accuracy_results if r.speedup > 0),
             key=lambda r: r.speedup,
             default=None,
         )
         print(
-            f"Accuracy vs bf16: worst max_rel={worst.max_sig_rel_err * 100:.3f}% "
+            f"Accuracy vs bf16 raw KV: worst max_rel={worst.max_sig_rel_err * 100:.3f}% "
             f"({worst.case}), mean_rel_avg="
             f"{sum(r.mean_sig_rel_err for r in accuracy_results) / len(accuracy_results) * 100:.3f}%"
+        )
+        print(
+            f"Accuracy vs bf16 dequant KV (fair): worst max_rel="
+            f"{worst_dequant.dequant_max_sig_rel_err * 100:.3f}% "
+            f"({worst_dequant.case}), worst cos_sim={worst_dequant.dequant_cosine_sim:.6f}"
         )
         if best_speed is not None:
             print(
