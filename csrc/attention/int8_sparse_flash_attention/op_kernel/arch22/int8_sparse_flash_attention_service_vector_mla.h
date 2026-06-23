@@ -901,13 +901,7 @@ __aicore__ inline void SFAVectorService<SFAT>::DequantInt8RowPerTile(LocalTensor
 {
     LocalTensor<half> halfUb = tmpBuff1.Get<half>();
     LocalTensor<float> fp32Ub = tmpBuff1.Get<float>()[KV_TILE_SIZE];
-    LocalTensor<float> scaleUb = tmpBuff1.Get<float>()[KV_TILE_SIZE * 2];
-    DataCopyExtParams scaleCopyParams;
-    scaleCopyParams.blockCount = 1;
-    scaleCopyParams.blockLen = KV_TILE_NUM * sizeof(float);
-    scaleCopyParams.srcStride = 0;
-    scaleCopyParams.dstStride = 0;
-    DataCopyPad(scaleUb, packedRowUb[headDim], scaleCopyParams);
+    LocalTensor<float> scaleUb = packedRowUb[headDim].template ReinterpretCast<float>();
 
     for (uint32_t tileIdx = 0; tileIdx < KV_TILE_NUM; ++tileIdx) {
         uint32_t start = tileIdx * KV_TILE_SIZE;
