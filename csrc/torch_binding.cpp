@@ -44,6 +44,7 @@
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "moe/moe_init_routing_custom/moe_init_routing_custom_torch_adpt.h"
 #include "attention/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
+#include "attention/int8_sparse_flash_attention/int8_sparse_flash_attention_torch_adpt.h"
 #include "attention/lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
 #include "attention/ngram_spec_decode/ngram_spec_decode_torch_adpt.h"
 #include "moe/causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
@@ -2321,6 +2322,20 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                           bool return_softmax_lse=False) -> (Tensor attention_out, Tensor softmax_max, Tensor softmax_sum)"
     );
     ops.impl("npu_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::npu_sparse_flash_attention);
+
+    ops.def(
+        "npu_int8_sparse_flash_attention(Tensor query, Tensor key, Tensor value,"
+        "                                Tensor sparse_indices, float scale_value, *,"
+        "                                Tensor? block_table=None, Tensor? actual_seq_lengths_query=None,"
+        "                                Tensor? actual_seq_lengths_kv=None, Tensor query_rope,"
+        "                                Tensor key_rope, float key_scale=1.0, float key_offset=0.0,"
+        "                                int sparse_block_size=1, str layout_query='TND',"
+        "                                str layout_kv='PA_BSND', int sparse_mode=3,"
+        "                                int pre_tokens=9223372036854775807,"
+        "                                int next_tokens=9223372036854775807, int attention_mode=2,"
+        "                                bool return_softmax_lse=False) -> (Tensor attention_out, Tensor softmax_max, Tensor softmax_sum)"
+    );
+    ops.impl("npu_int8_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::npu_int8_sparse_flash_attention);
 
     ops.def(
         "dispatch_ffn_combine(Tensor x, Tensor[] weight1, Tensor[] weight2, Tensor expert_idx,"

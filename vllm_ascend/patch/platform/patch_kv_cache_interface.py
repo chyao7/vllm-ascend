@@ -15,6 +15,10 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
 )
 
+from vllm_ascend.attention.sfa_k_nope_pack import (
+    K_NOPE_PACKED_BYTES,
+    K_NOPE_SCALE_METADATA_BYTES,
+)
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 
@@ -35,8 +39,12 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     to
     (kv_cache[0]: bfloat16, kv_cache[1]: bfloat16, kv_cache[2]: int8, kv_cache[3]: float16).
 
+    On 910B with Sparse C8, kv_cache[0] stores packed int8 kv_lora plus fp32
+    per-tile scale metadata (512 + 16 = 528 bytes per token). kv_cache[1]
+    still stores k_rope in bf16.
+
     The semantic meaning of each KV cache entry is as follows:
-    1. kv_cache[0] stores kv_lora.
+    1. kv_cache[0] stores kv_lora (bf16 by default, packed int8+scale on 910B C8).
     2. kv_cache[1] stores k_rope.
     3. kv_cache[2] stores the key tensor from the indexer module.
     4. kv_cache[3] stores the key scale tensor from the indexer module,
@@ -66,18 +74,34 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             assert len(self.sparse_head_dim) == 3
             num_heads_per_page = self.block_size * self.num_kv_heads
 
-            kv_lora_rank, qk_rope_head_dim, index_head_dim = self.sparse_head_dim
+            packed_k_nope_dim, qk_rope_head_dim, index_head_dim = self.sparse_head_dim
 
             # A5: kv_lora and k_rope are merged into a single CKV tensor (fp8).
-            # A3: separate kv_lora + k_rope (bf16).
             if qk_rope_head_dim == 0:
                 kv_dtype = self.c8_k_cache_dtype  # A5 CKV: float8_e4m3fn
-                kv_dim = kv_lora_rank
+                kv_dim = packed_k_nope_dim
+                kv_bytes = num_heads_per_page * kv_dim * get_dtype_size(kv_dtype)
+            elif (
+                get_ascend_device_type() != AscendDeviceType.A5
+                and packed_k_nope_dim == K_NOPE_PACKED_BYTES
+            ):
+                # 910B: packed int8 kv_lora + fp32 scales in kv_cache[0], bf16 k_rope in [1].
+                knope_bytes = (
+                    num_heads_per_page
+                    * packed_k_nope_dim
+                    * get_dtype_size(self.c8_k_cache_dtype)
+                )
+                rope_bytes = (
+                    num_heads_per_page
+                    * qk_rope_head_dim
+                    * get_dtype_size(self.dtype)
+                )
+                kv_bytes = knope_bytes + rope_bytes
             else:
-                kv_dtype = self.dtype  # A3 kv_lora + k_rope: bfloat16
-                kv_dim = kv_lora_rank + qk_rope_head_dim
+                kv_dtype = self.dtype
+                kv_dim = packed_k_nope_dim + qk_rope_head_dim
+                kv_bytes = num_heads_per_page * kv_dim * get_dtype_size(kv_dtype)
 
-            kv_bytes = num_heads_per_page * kv_dim * get_dtype_size(kv_dtype)
             qli_bytes = num_heads_per_page * index_head_dim * get_dtype_size(self.c8_k_cache_dtype)
             qli_scale_bytes = num_heads_per_page * 1 * get_dtype_size(self.c8_k_scale_cache_dtype)
             return kv_bytes + qli_bytes + qli_scale_bytes
@@ -107,17 +131,28 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             assert self.sparse_head_dim is not None
             assert self.cache_sparse_c8 is True
 
-            kv_lora_rank, qk_rope_head_dim, index_k_head_dim = self.sparse_head_dim
+            packed_k_nope_dim, qk_rope_head_dim, index_k_head_dim = self.sparse_head_dim
 
             if qk_rope_head_dim == 0:
                 # A5: ckv (float8_e4m3fn) and qli share c8_k_cache_dtype;
-                ckv_virtual = kv_lora_rank * get_dtype_size(self.c8_k_cache_dtype)
+                ckv_virtual = packed_k_nope_dim * get_dtype_size(self.c8_k_cache_dtype)
                 qk_rope_virtual = 0
                 qli_virtual = index_k_head_dim * get_dtype_size(self.c8_k_cache_dtype)
                 scale_virtual = get_dtype_size(self.c8_k_scale_cache_dtype)
                 return (ckv_virtual, qk_rope_virtual, qli_virtual, scale_virtual)
 
-            # A3: keep the original element-count / byte mix
+            if (
+                get_ascend_device_type() != AscendDeviceType.A5
+                and packed_k_nope_dim == K_NOPE_PACKED_BYTES
+            ):
+                # 910B sparse C8: byte-normalized virtual dims for 4-tensor split.
+                knope_virtual = packed_k_nope_dim * get_dtype_size(self.c8_k_cache_dtype)
+                rope_virtual = qk_rope_head_dim * get_dtype_size(self.dtype)
+                qli_virtual = index_k_head_dim * get_dtype_size(self.c8_k_cache_dtype)
+                scale_virtual = get_dtype_size(self.c8_k_scale_cache_dtype)
+                return (knope_virtual, rope_virtual, qli_virtual, scale_virtual)
+
+            # Legacy bf16 kv_lora + k_rope without packed knope.
             factor = get_dtype_size(self.dtype) // get_dtype_size(self.c8_k_cache_dtype)
             index_k_head_dim_virtual = index_k_head_dim // factor
 
@@ -125,7 +160,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             index_k_scale_head_dim_virtual = 1
 
             return (
-                kv_lora_rank,
+                packed_k_nope_dim,
                 qk_rope_head_dim,
                 index_k_head_dim_virtual,
                 index_k_scale_head_dim_virtual,

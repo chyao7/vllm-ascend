@@ -20,6 +20,11 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention.sfa_k_nope_pack import (
+    scatter_k_pe_to_cache,
+    scatter_packed_k_nope_to_cache,
+    use_910b_packed_k_nope_sparse_c8,
+)
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -853,6 +858,31 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _get_full_kv(self, k, attn_metadata):
         return k
 
+    def _write_k_nope_k_pe_cache(
+        self,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: tuple,
+        slot_mapping: torch.Tensor,
+        num_tokens: int,
+    ) -> None:
+        slots = slot_mapping[:num_tokens]
+        k_nope = k_nope[:num_tokens]
+        k_pe = k_pe[:num_tokens]
+        if self.use_sparse_c8_indexer and use_910b_packed_k_nope_sparse_c8():
+            scatter_packed_k_nope_to_cache(k_nope, kv_cache[0], slots)
+            scatter_k_pe_to_cache(k_pe, kv_cache[1], slots)
+        else:
+            k_nope = k_nope.view(k_nope.shape[0], 1, -1)
+            k_pe = k_pe.view(k_pe.shape[0], 1, -1)
+            DeviceOperator.reshape_and_cache(
+                key=k_nope,
+                value=k_pe,
+                key_cache=kv_cache[0],
+                value_cache=kv_cache[1],
+                slot_mapping=slots,
+            )
+
     def exec_kv(
         self,
         kv_no_split: torch.Tensor,
@@ -883,6 +913,27 @@ class AscendSFAImpl(MLAAttentionImpl):
                 is_output_kv=True,
             )
             return k_pe, k_nope
+        if self.use_sparse_c8_indexer and use_910b_packed_k_nope_sparse_c8():
+            _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
+                kv_no_split,
+                self.kv_a_layernorm.weight,  # type: ignore[union-attr]
+                cos,
+                sin,
+                slots.to(torch.int64),
+                kv_cache[1],
+                kv_cache[0],
+                epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
+                cache_mode=cache_mode,
+                is_output_kv=True,
+            )
+            self._write_k_nope_k_pe_cache(
+                k_nope,
+                k_pe,
+                kv_cache,
+                slots,
+                slots.numel(),
+            )
+            return None, None
         else:
             torch_npu.npu_kv_rmsnorm_rope_cache(
                 kv_no_split,
@@ -1262,14 +1313,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                         )
                     else:
                         k_pe, k_nope = fused_kv_no_split.split([self.qk_rope_head_dim, self.kv_lora_rank], dim=-1)
-                    k_nope = k_nope.view(k_nope.shape[0], 1, -1)
-                    k_pe = k_pe.view(k_pe.shape[0], 1, -1)
-                    DeviceOperator.reshape_and_cache(
-                        key=k_nope[: attn_metadata.num_actual_tokens],
-                        value=k_pe[: attn_metadata.num_actual_tokens],
-                        key_cache=kv_cache[0],
-                        value_cache=kv_cache[1],
-                        slot_mapping=slot_mapping[: attn_metadata.num_actual_tokens],
+                    self._write_k_nope_k_pe_cache(
+                        k_nope,
+                        k_pe,
+                        kv_cache,
+                        slot_mapping,
+                        attn_metadata.num_actual_tokens,
                     )
 
             k_li = self._get_full_kv(k_li, attn_metadata)

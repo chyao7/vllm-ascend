@@ -80,6 +80,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.worker.utils import select_common_block_size
 
+from vllm_ascend.attention.sfa_k_nope_pack import K_NOPE_SCALE_METADATA_BYTES
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, vllm_version_is
 
 if vllm_version_is("0.21.0"):
@@ -367,6 +368,14 @@ class NPUModelRunner(GPUModelRunner):
                 self.sparse_head_dim = (
                     a5_ckv_dim,
                     0,
+                    self.model_config.hf_text_config.index_head_dim,
+                )
+            elif self.ascend_config.enable_sparse_c8:
+                # 910B sparse C8: packed int8 kv_lora + fp32 scales in kv_cache[0].
+                kv_lora_rank = self.model_config.hf_text_config.kv_lora_rank
+                self.sparse_head_dim = (
+                    kv_lora_rank + K_NOPE_SCALE_METADATA_BYTES,
+                    self.model_config.hf_text_config.qk_rope_head_dim,
                     self.model_config.hf_text_config.index_head_dim,
                 )
             else:
@@ -4365,6 +4374,14 @@ class NPUModelRunner(GPUModelRunner):
                                 + self.model_config.hf_text_config.qk_rope_head_dim * 2
                                 + 4 * 4,
                             )
+                        elif self.use_sparse and current_sparse_c8 and get_ascend_device_type() != AscendDeviceType.A5:
+                            k_shape = (
+                                mla_num_blocks,
+                                mla_block_size,
+                                num_kv_heads,
+                                self.model_config.hf_text_config.kv_lora_rank
+                                + K_NOPE_SCALE_METADATA_BYTES,
+                            )
                         v_shape = (
                             mla_num_blocks,
                             mla_block_size,
@@ -4379,6 +4396,8 @@ class NPUModelRunner(GPUModelRunner):
                     
                     # A5 sparse C8: ckv uses float8_e4m3fn
                     if self.use_sparse and current_sparse_c8 and get_ascend_device_type() == AscendDeviceType.A5:
+                        k_cache_dtype = self.c8_k_cache_dtype
+                    elif self.use_sparse and current_sparse_c8 and get_ascend_device_type() != AscendDeviceType.A5:
                         k_cache_dtype = self.c8_k_cache_dtype
                     
                     k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape)

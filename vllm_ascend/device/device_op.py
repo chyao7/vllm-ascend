@@ -448,6 +448,28 @@ class BaseDeviceAdaptor:
         kv = kv_cache[0]
         key_rope = kv_cache[1]
 
+        if kv.dtype == torch.int8:
+            attn_output, _, _ = torch.ops._C_ascend.npu_int8_sparse_flash_attention(
+                query=ql_nope,
+                key=kv,
+                value=kv,
+                sparse_indices=topk_indices,
+                scale_value=sfa_impl.scale,
+                block_table=block_table,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_kv=actual_seq_lengths_key,
+                query_rope=q_pe,
+                key_rope=key_rope,
+                key_scale=1.0,
+                key_offset=0.0,
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+            )
+            return attn_output
+
         attn_output, _, _ = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
             key=kv,
