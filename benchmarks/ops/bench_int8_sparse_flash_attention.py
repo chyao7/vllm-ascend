@@ -253,6 +253,16 @@ def _make_sparse_indices(
     return topk
 
 
+def _dequant_kv_from_packed(packed: torch.Tensor, ref_shape: torch.Size, dtype: torch.dtype) -> torch.Tensor:
+    """Dequantize packed KV rows to match ``ref_shape`` (..., kv_lora_rank)."""
+    if packed.dtype != torch.uint8:
+        packed = packed.contiguous().view(torch.uint8)
+    k_dequant = dequantize_packed_k_nope(packed).to(dtype=dtype)
+    if k_dequant.shape != ref_shape:
+        k_dequant = k_dequant.reshape(ref_shape)
+    return k_dequant.contiguous()
+
+
 def _quantize_kv_packed_per_tile(kv_bf16: torch.Tensor) -> torch.Tensor:
     """Pack 512-dim k_nope rows into 528-byte int8 cache rows (910B sparse C8)."""
     *prefix, dim = kv_bf16.shape
@@ -260,7 +270,7 @@ def _quantize_kv_packed_per_tile(kv_bf16: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"packed quant expects kv_lora_rank={K_NOPE_INT8_DIM}, got {dim}")
     flat = kv_bf16.reshape(-1, dim)
     packed = quantize_k_nope_per_group(flat).view(torch.int8)
-    return packed.view(*prefix, K_NOPE_PACKED_BYTES)
+    return packed.view(*prefix, K_NOPE_PACKED_BYTES).contiguous()
 
 
 def _prepare_case(
@@ -343,11 +353,11 @@ def _run_bf16_sfa(prepared: PreparedCase) -> torch.Tensor:
 def _run_bf16_sfa_dequant_baseline(prepared: PreparedCase) -> torch.Tensor:
     """BF16 SFA with Python-side dequantized packed KV (fair int8 accuracy baseline)."""
     attn_metadata = SimpleNamespace(block_table=prepared.block_table)
-    k_dequant = dequantize_packed_k_nope(prepared.k_nope_int8.view(torch.uint8)).to(
-        prepared.k_nope_bf16.dtype
+    k_dequant = _dequant_kv_from_packed(
+        prepared.k_nope_int8,
+        prepared.k_nope_bf16.shape,
+        prepared.k_nope_bf16.dtype,
     )
-    if k_dequant.shape != prepared.k_nope_bf16.shape:
-        k_dequant = k_dequant.reshape(prepared.k_nope_bf16.shape)
     out, _, _ = torch.ops._C_ascend.npu_sparse_flash_attention(
         query=prepared.ql_nope,
         key=k_dequant,
@@ -535,9 +545,11 @@ def main() -> int:
                     _,
                     dequant_cosine_sim,
                 ) = _compute_accuracy(dequant_bf16_out, int8_out)
-                k_dequant = dequantize_packed_k_nope(
-                    prepared.k_nope_int8.view(torch.uint8)
-                ).to(prepared.k_nope_bf16.dtype)
+                k_dequant = _dequant_kv_from_packed(
+                    prepared.k_nope_int8,
+                    prepared.k_nope_bf16.shape,
+                    prepared.k_nope_bf16.dtype,
+                )
                 _, _, _, _, _, kv_dequant_cosine_sim = _compute_accuracy(
                     prepared.k_nope_bf16, k_dequant
                 )

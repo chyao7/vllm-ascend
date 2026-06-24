@@ -68,16 +68,29 @@ def quantize_k_nope_per_group(k_nope: torch.Tensor) -> torch.Tensor:
             -128, 127
         ).to(torch.int8)
 
-    return packed.view(*orig_shape, K_NOPE_PACKED_BYTES)
+    return packed.view(*orig_shape, K_NOPE_PACKED_BYTES).contiguous()
 
 
 def dequantize_packed_k_nope(packed: torch.Tensor) -> torch.Tensor:
     """Dequantize packed k_nope rows back to float32 [..., kv_lora_rank]."""
     orig_shape = packed.shape[:-1]
-    packed = packed.reshape(-1, K_NOPE_PACKED_BYTES)
-    k_int8 = packed[:, :K_NOPE_INT8_DIM].to(torch.float32)
-    scales = packed[:, K_NOPE_INT8_DIM :].view(torch.float32)
-    dequant = torch.zeros_like(k_int8, dtype=torch.float32)
+    # Force base-format contiguous uint8 rows so scale metadata (fp32 at byte 512)
+    # is not misread on NPU when the cache tensor uses internal layouts.
+    packed_u8 = packed.reshape(-1, K_NOPE_PACKED_BYTES).contiguous()
+    if packed_u8.dtype != torch.uint8:
+        packed_u8 = packed_u8.view(torch.uint8)
+
+    num_tokens = packed_u8.shape[0]
+    device = packed_u8.device
+    k_int8 = packed_u8[:, :K_NOPE_INT8_DIM].view(torch.int8).to(torch.float32)
+    scale_bytes = packed_u8[:, K_NOPE_INT8_DIM : K_NOPE_PACKED_BYTES].contiguous()
+    scales = scale_bytes.view(torch.float32)
+    dequant = torch.empty(
+        num_tokens,
+        K_NOPE_INT8_DIM,
+        dtype=torch.float32,
+        device=device,
+    )
     for tile_idx in range(K_NOPE_NUM_TILES):
         start = tile_idx * K_NOPE_TILE_SIZE
         end = start + K_NOPE_TILE_SIZE
