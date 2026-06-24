@@ -141,8 +141,6 @@ public:
     static constexpr uint32_t DQ_FP32_UB_OFFSET = DQ_ALIGNED_ROW_BYTES;
     static constexpr uint32_t DQ_HALF_UB_OFFSET =
         DQ_FP32_UB_OFFSET + KV_TILE_SIZE * static_cast<uint32_t>(sizeof(float));
-    static constexpr uint32_t DQ_SCALE_UB_OFFSET =
-        DQ_HALF_UB_OFFSET + KV_TILE_SIZE * static_cast<uint32_t>(sizeof(half));
     static constexpr bool PAGE_ATTENTION = SFAT::pageAttention;
     static constexpr int TEMPLATE_MODE = SFAT::templateMode;
     static constexpr bool FLASH_DECODE = SFAT::flashDecode;
@@ -896,11 +894,12 @@ __aicore__ inline void SFAVectorService<SFAT>::DequantInt8RowPerTile(LocalTensor
     LocalTensor<KV_INT8_T> alignedRowUb =
         tmpBuff1.GetWithOffset<KV_INT8_T>(KV_MERGE_STAGE_MAX_DIM, 0);
     DataCopy(alignedRowUb, packedRowUb, KV_PACKED_ROW_SIZE);
+    PipeBarrier<PIPE_MTE2>();
 
     LocalTensor<float> fp32Ub = tmpBuff1.GetWithOffset<float>(KV_TILE_SIZE, DQ_FP32_UB_OFFSET);
     LocalTensor<half> halfUb = tmpBuff1.GetWithOffset<half>(KV_TILE_SIZE, DQ_HALF_UB_OFFSET);
-    LocalTensor<float> scaleUb = tmpBuff1.GetWithOffset<float>(KV_TILE_NUM, DQ_SCALE_UB_OFFSET);
-    DataCopy(scaleUb, alignedRowUb[KV_NOPE_INT8_DIM].template ReinterpretCast<float>(), KV_TILE_NUM);
+    LocalTensor<float> scaleUb =
+        alignedRowUb[KV_NOPE_INT8_DIM].template ReinterpretCast<float>();
 
     for (uint32_t tileIdx = 0; tileIdx < KV_TILE_NUM; ++tileIdx) {
         uint32_t start = tileIdx * KV_TILE_SIZE;
@@ -911,6 +910,7 @@ __aicore__ inline void SFAVectorService<SFAT>::DequantInt8RowPerTile(LocalTensor
         Muls(fp32Ub, fp32Ub, scale, KV_TILE_SIZE);
         Cast(dstUb[start], fp32Ub, RoundMode::CAST_ROUND, KV_TILE_SIZE);
     }
+    PipeBarrier<PIPE_V>();
 }
 
 template <typename SFAT>

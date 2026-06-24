@@ -382,8 +382,8 @@ def _run_int8_sfa(prepared: PreparedCase) -> torch.Tensor:
     attn_metadata = SimpleNamespace(block_table=prepared.block_table)
     out, _, _ = torch.ops._C_ascend.npu_int8_sparse_flash_attention(
         query=prepared.ql_nope,
-        key=prepared.k_nope_int8,
-        value=prepared.k_nope_int8,
+        key=prepared.k_nope_int8.contiguous(),
+        value=prepared.k_nope_int8.contiguous(),
         sparse_indices=prepared.sparse_indices,
         scale_value=prepared.scale,
         block_table=attn_metadata.block_table,
