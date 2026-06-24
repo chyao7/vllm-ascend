@@ -159,6 +159,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="npu:0")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--json-out", type=str, default="", help="Optional path to save JSON results")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print staged intermediate checks (KV pack/gather/dequant, per-token output) to locate accuracy bugs",
+    )
+    parser.add_argument(
+        "--debug-q-token",
+        type=int,
+        default=0,
+        help="Query token index (TND T axis) for detailed topk/gather dump when --debug is set",
+    )
+    parser.add_argument(
+        "--debug-topk-samples",
+        type=int,
+        default=8,
+        help="How many valid topk indices to dump for --debug-q-token",
+    )
     return parser.parse_args()
 
 
@@ -422,6 +439,315 @@ def _benchmark_npu(fn: Callable[[], torch.Tensor], warmup: int, iters: int) -> f
     return float(np.min(times[warmup:]))
 
 
+def _pa_token_to_logical_row(
+    block_table: torch.Tensor,
+    batch_idx: int,
+    token_idx: int,
+    block_size: int,
+) -> int:
+    """Mirror kernel GetKeyGmOffset (PA_BSND, kvHeadNum=1): token -> flat cache row."""
+    blk_idx = token_idx // block_size
+    blk_off = token_idx % block_size
+    physical_block = int(block_table[batch_idx, blk_idx].item())
+    return physical_block * block_size + blk_off
+
+
+def _cos_sim(a: torch.Tensor, b: torch.Tensor) -> float:
+    flat_a = a.float().reshape(-1)
+    flat_b = b.float().reshape(-1)
+    if flat_a.numel() == 0:
+        return 1.0
+    return float(
+        torch.nn.functional.cosine_similarity(flat_a.unsqueeze(0), flat_b.unsqueeze(0)).item()
+    )
+
+
+def _valid_topk_for_query(
+    sparse_indices: torch.Tensor,
+    q_t: int,
+    seq_q: int,
+    seq_kv: int,
+) -> list[int]:
+    """Return causal-valid topk token indices in kernel MergeKv order (skip -1)."""
+    q_local = q_t % seq_q if seq_q > 0 else 0
+    ctx_len = seq_kv - seq_q
+    causal_limit = min(ctx_len + q_local + 1, seq_kv)
+    topk_row = sparse_indices[q_t, 0, :].cpu().tolist()
+    return [idx for idx in topk_row if 0 <= idx < causal_limit]
+
+
+def _gather_dequant_nope_rope(
+    prepared: PreparedCase,
+    batch_idx: int,
+    token_indices: list[int],
+    block_size: int,
+    kv_lora_rank: int,
+    rope_dim: int,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather dequant k_nope [K,512] and k_rope [K,64] via PA block_table (mirrors GetKeyGmOffset)."""
+    if not token_indices:
+        empty_nope = torch.empty(0, kv_lora_rank, dtype=dtype, device=prepared.ql_nope.device)
+        empty_rope = torch.empty(0, rope_dim, dtype=dtype, device=prepared.ql_nope.device)
+        return empty_nope, empty_rope
+
+    flat_packed = prepared.k_nope_int8.reshape(-1, K_NOPE_PACKED_BYTES)
+    flat_rope = prepared.k_rope_cache.reshape(-1, rope_dim)
+    nope_rows: list[torch.Tensor] = []
+    rope_rows: list[torch.Tensor] = []
+    for kv_t in token_indices:
+        log_row = _pa_token_to_logical_row(prepared.block_table, batch_idx, kv_t, block_size)
+        row_u8 = flat_packed[log_row].contiguous().view(torch.uint8)
+        nope_rows.append(dequantize_packed_k_nope(row_u8).squeeze(0).to(dtype=dtype))
+        rope_rows.append(flat_rope[log_row].to(dtype=dtype))
+    return torch.stack(nope_rows, dim=0), torch.stack(rope_rows, dim=0)
+
+
+def _python_sparse_oracle_token(
+    prepared: PreparedCase,
+    q_t: int,
+    case: BenchCase,
+    args: argparse.Namespace,
+) -> torch.Tensor:
+    """Reference MLA sparse attention for one query token (topk gather + softmax + V=nope)."""
+    seq_q = case.seq_q
+    batch_idx = q_t // seq_q if seq_q > 0 else 0
+    valid_topk = _valid_topk_for_query(
+        prepared.sparse_indices, q_t, seq_q, case.seq_kv
+    )
+    dtype = prepared.ql_nope.dtype
+    kv_lora_rank = args.kv_lora_rank
+    rope_dim = args.qk_rope_head_dim
+
+    k_nope, k_rope = _gather_dequant_nope_rope(
+        prepared,
+        batch_idx,
+        valid_topk,
+        args.block_size,
+        kv_lora_rank,
+        rope_dim,
+        dtype,
+    )
+    if k_nope.numel() == 0:
+        n_heads = args.num_heads_q
+        return torch.zeros(n_heads, kv_lora_rank, dtype=dtype, device=prepared.ql_nope.device)
+
+    k_full = torch.cat([k_nope, k_rope], dim=-1)  # [K, 576]
+    q_nope = prepared.ql_nope[q_t]  # [H, 512]
+    q_pe = prepared.q_pe[q_t]  # [H, 64]
+    q_full = torch.cat([q_nope, q_pe], dim=-1)  # [H, 576]
+
+    scores = torch.matmul(q_full.float(), k_full.float().T) * prepared.scale
+    attn = torch.softmax(scores, dim=-1)
+    out = torch.matmul(attn, k_nope.float()).to(dtype)
+    return out
+
+
+def _python_sparse_oracle(
+    prepared: PreparedCase,
+    case: BenchCase,
+    args: argparse.Namespace,
+) -> torch.Tensor:
+    """Reference sparse attention for all query tokens."""
+    outputs = [
+        _python_sparse_oracle_token(prepared, q_t, case, args)
+        for q_t in range(prepared.q_tokens)
+    ]
+    return torch.stack(outputs, dim=0)
+
+
+def _print_debug_stages(
+    case: BenchCase,
+    args: argparse.Namespace,
+    prepared: PreparedCase,
+    bf16_out: torch.Tensor,
+    dequant_bf16_out: torch.Tensor,
+    int8_out: torch.Tensor,
+) -> None:
+    """Staged comparison to locate int8 kernel bugs (MergeKv vs post-MergeKv)."""
+    block_size = args.block_size
+    kv_lora_rank = args.kv_lora_rank
+    rope_dim = args.qk_rope_head_dim
+    n_heads = args.num_heads_q
+    dtype = prepared.k_nope_bf16.dtype
+
+    oracle_out = _python_sparse_oracle(prepared, case, args)
+
+    print()
+    print(f"[debug] case={case.name}  staged intermediate comparison")
+    print("  Legend: cos>0.99 expected for correct stages")
+    print(
+        f"  {'stage':<42} {'cos vs bf16':>12} {'cos vs int8':>12} {'interpretation':}"
+    )
+    print("  " + "-" * 96)
+
+    stages: list[tuple[str, torch.Tensor, str]] = [
+        (
+            "A  bf16 SFA (raw KV)",
+            bf16_out,
+            "ground truth (bf16 cache)",
+        ),
+        (
+            "B  bf16 SFA + Python dequant KV",
+            dequant_bf16_out,
+            "quant error only; ~1.0 vs A",
+        ),
+        (
+            "C  Python oracle (topk gather+attn)",
+            oracle_out,
+            "reference MergeKv+attn in PyTorch",
+        ),
+        (
+            "D  int8 SFA kernel",
+            int8_out,
+            "device int8 op output",
+        ),
+    ]
+
+    for label, tensor, note in stages:
+        cos_bf16 = _cos_sim(tensor, bf16_out)
+        cos_int8 = _cos_sim(tensor, int8_out)
+        print(f"  {label:<42} {cos_bf16:12.6f} {cos_int8:12.6f}  {note}")
+
+    cos_oracle_dequant = _cos_sim(oracle_out, dequant_bf16_out)
+    cos_oracle_int8 = _cos_sim(oracle_out, int8_out)
+    print("  " + "-" * 96)
+    print(
+        f"  Key: oracle vs dequant_bf16={cos_oracle_dequant:.6f}, "
+        f"oracle vs int8={cos_oracle_int8:.6f}"
+    )
+    if cos_oracle_dequant > 0.99 and cos_oracle_int8 < 0.9:
+        print(
+            "  => Python MergeKv+attn matches bf16 path; int8 kernel diverges "
+            "(bug inside npu_int8_sparse_flash_attention, likely Vec0 dequant or cube read)."
+        )
+    elif cos_oracle_dequant < 0.99:
+        print(
+            "  => Oracle vs dequant_bf16 low: check topk/gather path or bf16 SFA baseline."
+        )
+    else:
+        print("  => All stages aligned.")
+
+    print()
+    print("  Stage 0  full KV cache: Python dequant(packed int8) vs bf16 raw")
+    k_dequant = _dequant_kv_from_packed(
+        prepared.k_nope_int8, prepared.k_nope_bf16.shape, dtype
+    )
+    print(f"           cache cos={_cos_sim(prepared.k_nope_bf16, k_dequant):.6f}")
+
+    print("  Stage 1  attention output: per query token (TND T axis)")
+    print(
+        f"           {'q_t':>5} {'batch':>5} {'bf16_vs_int8':>14} "
+        f"{'dequant_vs_int8':>18} {'oracle_vs_int8':>16}"
+    )
+    s_q = case.seq_q
+    for t in range(prepared.q_tokens):
+        b_idx = t // s_q if s_q > 0 else 0
+        cos_bi = _cos_sim(bf16_out[t], int8_out[t])
+        cos_di = _cos_sim(dequant_bf16_out[t], int8_out[t])
+        cos_oi = _cos_sim(oracle_out[t], int8_out[t])
+        print(
+            f"           {t:5d} {b_idx:5d} {cos_bi:14.6f} {cos_di:18.6f} {cos_oi:16.6f}"
+        )
+
+    q_t = args.debug_q_token
+    if q_t < 0 or q_t >= prepared.q_tokens:
+        print(f"  Stage 2  skipped: --debug-q-token={q_t} out of range [0, {prepared.q_tokens})")
+        return
+
+    batch_idx = q_t // s_q if s_q > 0 else 0
+    q_local = q_t % s_q if s_q > 0 else 0
+    ctx_len = case.seq_kv - s_q
+    causal_limit = min(ctx_len + q_local + 1, case.seq_kv)
+
+    valid_topk = _valid_topk_for_query(
+        prepared.sparse_indices, q_t, s_q, case.seq_kv
+    )
+    print(
+        f"  Stage 2  MergeKv reference (topk order) for q_t={q_t} "
+        f"(batch={batch_idx}, q_local={q_local}, causal_limit={causal_limit}, "
+        f"valid_k={len(valid_topk)})"
+    )
+    topk_row = prepared.sparse_indices[q_t, 0, :].cpu().tolist()
+    print(f"           first topk indices: {topk_row[: min(16, len(topk_row))]}")
+    print(
+        f"           {'rank':>5} {'kv_t':>6} {'log_row':>8} {'nope_cos':>10} "
+        f"{'rope_cos':>10} {'scale_fp32':>32}"
+    )
+
+    flat_packed = prepared.k_nope_int8.reshape(-1, K_NOPE_PACKED_BYTES)
+    flat_bf16 = prepared.k_nope_bf16.reshape(-1, kv_lora_rank)
+    flat_rope = prepared.k_rope_cache.reshape(-1, rope_dim)
+    num_samples = min(args.debug_topk_samples, len(valid_topk))
+
+    for rank in range(num_samples):
+        kv_t = valid_topk[rank]
+        log_row = _pa_token_to_logical_row(prepared.block_table, batch_idx, kv_t, block_size)
+        row_u8 = flat_packed[log_row].contiguous().view(torch.uint8)
+        ref_nope = flat_bf16[log_row].float().cpu()
+        ref_rope = flat_rope[log_row].float().cpu()
+        dq_nope = dequantize_packed_k_nope(row_u8).squeeze(0)
+        scale_bytes = row_u8[K_NOPE_INT8_DIM : K_NOPE_PACKED_BYTES].contiguous()
+        scales = scale_bytes.view(torch.float32).tolist()
+        pack_cos = _cos_sim(ref_nope, dq_nope)
+        rope_cos = _cos_sim(ref_rope, flat_rope[log_row].float().cpu())
+        print(
+            f"           {rank:5d} {kv_t:6d} {log_row:8d} {pack_cos:10.6f} "
+            f"{rope_cos:10.6f} {str([round(s, 6) for s in scales]):>32}"
+        )
+
+    # Merged K stats (kvMergeGm layout reference: [K,512] nope + [K,64] rope)
+    k_nope_m, k_rope_m = _gather_dequant_nope_rope(
+        prepared,
+        batch_idx,
+        valid_topk[:num_samples],
+        block_size,
+        kv_lora_rank,
+        rope_dim,
+        dtype,
+    )
+    if k_nope_m.numel() > 0:
+        k_full_m = torch.cat([k_nope_m, k_rope_m], dim=-1)
+        print(
+            f"  Stage 2b merged K (first {num_samples} topk rows): "
+            f"nope_norm={k_nope_m.float().norm():.4e}, rope_norm={k_rope_m.float().norm():.4e}, "
+            f"K_full shape={tuple(k_full_m.shape)}"
+        )
+        print(
+            f"           merged K[0,:8]={k_full_m[0, :8].float().cpu().tolist()}"
+        )
+
+    # Worst head slice at debug q token
+    diff = (int8_out[q_t].float() - bf16_out[q_t].float()).abs()
+    per_head_err = diff.mean(dim=-1)
+    worst_head = int(per_head_err.argmax().item())
+    print(
+        f"  Stage 3  worst head at q_t={q_t}: head={worst_head}, "
+        f"mean_abs={per_head_err[worst_head].item():.4e}, "
+        f"head_cos_bf16={_cos_sim(bf16_out[q_t, worst_head], int8_out[q_t, worst_head]):.6f}, "
+        f"head_cos_oracle={_cos_sim(oracle_out[q_t, worst_head], int8_out[q_t, worst_head]):.6f}"
+    )
+    print(
+        f"           bf16_out[{q_t},{worst_head},:4]={bf16_out[q_t, worst_head, :4].float().cpu().tolist()}"
+    )
+    print(
+        f"           int8_out[{q_t},{worst_head},:4]={int8_out[q_t, worst_head, :4].float().cpu().tolist()}"
+    )
+    print(
+        f"           oracle [{q_t},{worst_head},:4]={oracle_out[q_t, worst_head, :4].float().cpu().tolist()}"
+    )
+    print(
+        f"           dequant[{q_t},{worst_head},:4]={dequant_bf16_out[q_t, worst_head, :4].float().cpu().tolist()}"
+    )
+    print(
+        "  Note: kvMergeGm lives in device workspace; above merged K is the Python reference "
+        "for Vec0 output. If oracle~dequant but int8 diverges, rebuild CANN custom op:"
+    )
+    print("        bash csrc/build_aclnn.sh $(pwd) ascend910b")
+    print("        # verify: python3 benchmarks/ops/verify_int8_sfa_build.py")
+    print()
+
+
 def _compute_accuracy(
     bf16_out: torch.Tensor,
     int8_out: torch.Tensor,
@@ -571,6 +897,11 @@ def main() -> int:
                 _, _, _, _, _, dequant_baseline_cosine_sim = _compute_accuracy(
                     bf16_out, dequant_bf16_out
                 )
+
+                if args.debug:
+                    _print_debug_stages(
+                        case, args, prepared, bf16_out, dequant_bf16_out, int8_out
+                    )
 
                 bf16_ms = 0.0
                 int8_ms = 0.0
