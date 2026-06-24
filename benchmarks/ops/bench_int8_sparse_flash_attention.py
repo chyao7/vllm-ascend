@@ -89,6 +89,7 @@ class AccuracyResult:
     dequant_max_sig_rel_err: float
     dequant_cosine_sim: float
     kv_dequant_cosine_sim: float
+    kv_npu_row_cos: float
     dequant_baseline_cosine_sim: float
     bf16_latency_ms: float
     int8_latency_ms: float
@@ -553,6 +554,17 @@ def main() -> int:
                 _, _, _, _, _, kv_dequant_cosine_sim = _compute_accuracy(
                     prepared.k_nope_bf16, k_dequant
                 )
+                # Verify NPU-side packed bytes: clone one cache row to CPU and dequant.
+                sample_row_u8 = (
+                    prepared.k_nope_int8[1, 0, 0, :].contiguous().view(torch.uint8).cpu()
+                )
+                sample_ref = prepared.k_nope_bf16[1, 0, 0, :].float().cpu()
+                sample_dq = dequantize_packed_k_nope(sample_row_u8).squeeze(0)
+                kv_npu_row_cos = float(
+                    torch.nn.functional.cosine_similarity(
+                        sample_ref.unsqueeze(0), sample_dq.unsqueeze(0)
+                    ).item()
+                )
                 _, _, _, _, _, dequant_baseline_cosine_sim = _compute_accuracy(
                     bf16_out, dequant_bf16_out
                 )
@@ -576,6 +588,7 @@ def main() -> int:
                     dequant_max_sig_rel_err=dequant_max_sig_rel_err,
                     dequant_cosine_sim=dequant_cosine_sim,
                     kv_dequant_cosine_sim=kv_dequant_cosine_sim,
+                    kv_npu_row_cos=kv_npu_row_cos,
                     dequant_baseline_cosine_sim=dequant_baseline_cosine_sim,
                     bf16_latency_ms=bf16_ms,
                     int8_latency_ms=int8_ms,
@@ -645,8 +658,9 @@ def main() -> int:
         sanity = accuracy_results[0]
         print(
             f"Sanity ({sanity.case}): pack_kv_cos={sanity.kv_dequant_cosine_sim:.6f}, "
+            f"npu_row_cos={sanity.kv_npu_row_cos:.6f}, "
             f"dequant_sfa_cos={sanity.dequant_baseline_cosine_sim:.6f} "
-            f"(expect both >0.99 if quant baseline is valid)"
+            f"(expect all >0.99 if quant baseline is valid)"
         )
         if best_speed is not None:
             print(
