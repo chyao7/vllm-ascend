@@ -74,7 +74,7 @@ public:
                                     int64_t realS2Idx2, const RunInfo &runInfo);
     __aicore__ inline void CopyOutMrgeResult(int64_t mte2Size, int64_t mte3Size, int64_t s2StartGmOffset,
                                              int64_t mergeMte3Idx, const RunInfo &runInfo);
-    __aicore__ inline void DequantInt8RowPerTile(LocalTensor<KV_T> &dstUb, LocalTensor<KV_INT8_T> packedRowUb,
+    __aicore__ inline void DequantInt8RowPerTile(LocalTensor<KV_T> dstUb, LocalTensor<KV_INT8_T> packedRowUb,
                                                  uint32_t headDim);
     __aicore__ inline void SetInfInBlk(const LocalTensor<T> &mmResUb, uint32_t dealRowCount, uint32_t columnCount,
                                        uint64_t startId, uint64_t endId);
@@ -890,15 +890,18 @@ __aicore__ inline int64_t SFAVectorService<SFAT>::GetKeyRopeGmOffset(int64_t rea
 }
 
 template <typename SFAT>
-__aicore__ inline void SFAVectorService<SFAT>::DequantInt8RowPerTile(LocalTensor<KV_T> &dstUb,
+__aicore__ inline void SFAVectorService<SFAT>::DequantInt8RowPerTile(LocalTensor<KV_T> dstUb,
                                                                     LocalTensor<KV_INT8_T> packedRowUb,
                                                                     uint32_t headDim)
 {
     (void)headDim;
     LocalTensor<KV_INT8_T> alignedRowUb =
         tmpBuff1.GetWithOffset<KV_INT8_T>(KV_MERGE_STAGE_MAX_DIM, 0);
+    SetFlag<AscendC::HardEvent::V_MTE2>(0);
+    WaitFlag<AscendC::HardEvent::V_MTE2>(0);
     DataCopy(alignedRowUb, packedRowUb, KV_PACKED_ROW_SIZE);
-    PipeBarrier<PIPE_MTE2>();
+    SetFlag<AscendC::HardEvent::MTE2_V>(0);
+    WaitFlag<AscendC::HardEvent::MTE2_V>(0);
 
     LocalTensor<float> fp32Ub = tmpBuff1.GetWithOffset<float>(KV_TILE_SIZE, DQ_FP32_UB_OFFSET);
     LocalTensor<half> halfUb = tmpBuff1.GetWithOffset<half>(KV_TILE_SIZE, DQ_HALF_UB_OFFSET);
@@ -909,12 +912,15 @@ __aicore__ inline void SFAVectorService<SFAT>::DequantInt8RowPerTile(LocalTensor
         uint32_t start = tileIdx * KV_TILE_SIZE;
         LocalTensor<KV_INT8_T> tileInt8Ub = alignedRowUb[start];
         Cast(halfUb, tileInt8Ub, RoundMode::CAST_NONE, KV_TILE_SIZE);
+        PipeBarrier<PIPE_V>();
         Cast(fp32Ub, halfUb, RoundMode::CAST_NONE, KV_TILE_SIZE);
+        PipeBarrier<PIPE_V>();
         float scale = scaleUb.GetValue(tileIdx);
         Muls(fp32Ub, fp32Ub, scale, KV_TILE_SIZE);
+        PipeBarrier<PIPE_V>();
         Cast(dstUb[start], fp32Ub, RoundMode::CAST_ROUND, KV_TILE_SIZE);
+        PipeBarrier<PIPE_V>();
     }
-    PipeBarrier<PIPE_V>();
 }
 
 template <typename SFAT>
