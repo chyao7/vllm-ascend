@@ -135,13 +135,10 @@ public:
     static constexpr uint32_t KV_PACKED_ROW_SIZE = 528U;
     static constexpr uint32_t KV_NOPE_INT8_DIM = 512U;
     static constexpr uint32_t KV_MERGE_STAGE_MAX_DIM = 544U;
-    static constexpr uint32_t KV_MERGE_UB_ROW_PAD = KV_MERGE_STAGE_MAX_DIM - KV_PACKED_ROW_SIZE;
     static constexpr uint32_t KV_TILE_SIZE = 128U;
     static constexpr uint32_t KV_TILE_NUM = 4U;
     static constexpr uint32_t DQ_ALIGNED_ROW_BYTES = 544U;
     static constexpr uint32_t DQ_FP32_UB_OFFSET = DQ_ALIGNED_ROW_BYTES;
-    static constexpr uint32_t DQ_SCALE_UB_OFFSET =
-        DQ_FP32_UB_OFFSET + KV_TILE_SIZE * static_cast<uint32_t>(sizeof(float));
     static constexpr bool PAGE_ATTENTION = SFAT::pageAttention;
     static constexpr int TEMPLATE_MODE = SFAT::templateMode;
     static constexpr bool FLASH_DECODE = SFAT::flashDecode;
@@ -897,8 +894,9 @@ __aicore__ inline void SFAVectorService<SFAT>::DequantInt8RowPerTile(LocalTensor
     DataCopy(alignedRowUb, packedRowUb, KV_PACKED_ROW_SIZE);
 
     LocalTensor<float> fp32Ub = tmpBuff1.GetWithOffset<float>(KV_TILE_SIZE, DQ_FP32_UB_OFFSET);
-    LocalTensor<float> scaleUb = tmpBuff1.GetWithOffset<float>(KV_TILE_NUM, DQ_SCALE_UB_OFFSET);
-    DataCopy(scaleUb, alignedRowUb[KV_NOPE_INT8_DIM], KV_TILE_NUM);
+    // Scales sit at byte offset 512 inside the packed row; alignedRowUb is 32B-aligned.
+    LocalTensor<float> scaleUb =
+        alignedRowUb[KV_NOPE_INT8_DIM].template ReinterpretCast<float>();
 
     for (uint32_t tileIdx = 0; tileIdx < KV_TILE_NUM; ++tileIdx) {
         uint32_t start = tileIdx * KV_TILE_SIZE;
@@ -920,11 +918,14 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyPackedKvRowsToUb(LocalTensor<
     }
     DataCopyExtParams intriParams;
     intriParams.blockLen = KV_PACKED_ROW_SIZE * sizeof(KV_INT8_T);
-    intriParams.blockCount = rowCount;
-    intriParams.dstStride = KV_MERGE_UB_ROW_PAD * sizeof(KV_INT8_T);
+    intriParams.blockCount = 1;
+    intriParams.dstStride = 0;
     intriParams.srcStride = 0;
     DataCopyPadExtParams<KV_INT8_T> padParams;
-    DataCopyPad(dstUb, srcGm, intriParams, padParams);
+    for (uint32_t rowIdx = 0; rowIdx < rowCount; ++rowIdx) {
+        DataCopyPad(dstUb[rowIdx * KV_MERGE_STAGE_MAX_DIM], srcGm[rowIdx * KV_PACKED_ROW_SIZE], intriParams,
+                    padParams);
+    }
 }
 
 template <typename SFAT>
