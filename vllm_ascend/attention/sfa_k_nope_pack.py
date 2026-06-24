@@ -77,7 +77,7 @@ def dequantize_packed_k_nope(packed: torch.Tensor) -> torch.Tensor:
     packed = packed.reshape(-1, K_NOPE_PACKED_BYTES)
     k_int8 = packed[:, :K_NOPE_INT8_DIM].to(torch.float32)
     scales = packed[:, K_NOPE_INT8_DIM :].view(torch.float32)
-    dequant = torch.empty_like(k_int8)
+    dequant = torch.zeros_like(k_int8, dtype=torch.float32)
     for tile_idx in range(K_NOPE_NUM_TILES):
         start = tile_idx * K_NOPE_TILE_SIZE
         end = start + K_NOPE_TILE_SIZE

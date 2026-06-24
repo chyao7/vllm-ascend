@@ -88,6 +88,8 @@ class AccuracyResult:
     cosine_sim: float
     dequant_max_sig_rel_err: float
     dequant_cosine_sim: float
+    kv_dequant_cosine_sim: float
+    dequant_baseline_cosine_sim: float
     bf16_latency_ms: float
     int8_latency_ms: float
     speedup: float
@@ -533,6 +535,15 @@ def main() -> int:
                     _,
                     dequant_cosine_sim,
                 ) = _compute_accuracy(dequant_bf16_out, int8_out)
+                k_dequant = dequantize_packed_k_nope(
+                    prepared.k_nope_int8.view(torch.uint8)
+                ).to(prepared.k_nope_bf16.dtype)
+                _, _, _, _, _, kv_dequant_cosine_sim = _compute_accuracy(
+                    prepared.k_nope_bf16, k_dequant
+                )
+                _, _, _, _, _, dequant_baseline_cosine_sim = _compute_accuracy(
+                    bf16_out, dequant_bf16_out
+                )
 
                 bf16_ms = 0.0
                 int8_ms = 0.0
@@ -552,6 +563,8 @@ def main() -> int:
                     cosine_sim=cosine_sim,
                     dequant_max_sig_rel_err=dequant_max_sig_rel_err,
                     dequant_cosine_sim=dequant_cosine_sim,
+                    kv_dequant_cosine_sim=kv_dequant_cosine_sim,
+                    dequant_baseline_cosine_sim=dequant_baseline_cosine_sim,
                     bf16_latency_ms=bf16_ms,
                     int8_latency_ms=int8_ms,
                     speedup=speedup,
@@ -616,6 +629,12 @@ def main() -> int:
             f"Accuracy vs bf16 dequant KV (fair): worst max_rel="
             f"{worst_dequant.dequant_max_sig_rel_err * 100:.3f}% "
             f"({worst_dequant.case}), worst cos_sim={worst_dequant.dequant_cosine_sim:.6f}"
+        )
+        sanity = accuracy_results[0]
+        print(
+            f"Sanity ({sanity.case}): pack_kv_cos={sanity.kv_dequant_cosine_sim:.6f}, "
+            f"dequant_sfa_cos={sanity.dequant_baseline_cosine_sim:.6f} "
+            f"(expect both >0.99 if quant baseline is valid)"
         )
         if best_speed is not None:
             print(
