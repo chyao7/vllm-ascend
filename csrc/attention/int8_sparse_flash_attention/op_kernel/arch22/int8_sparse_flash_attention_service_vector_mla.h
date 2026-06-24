@@ -131,14 +131,20 @@ public:
     static constexpr uint32_t FP32_REPEAT_ELEMENT_NUM = REPEAT_BLOCK_BYTE / sizeof(float);
     // repeat stride不能超过256
     static constexpr uint32_t REPEATE_STRIDE_UP_BOUND = 256;
-    static constexpr uint32_t KV_MERGE_STAGE_ROWS = 32U;
     // Logical D=516 (512 int8 + 4 fp32 scales); physical row is 528 bytes in GM.
     static constexpr uint32_t KV_NOPE_INT8_DIM = 512U;
     static constexpr uint32_t KV_NOPE_NUM_FP32_SCALES = 4U;
     static constexpr uint32_t KV_PACKED_LOGICAL_DIM = KV_NOPE_INT8_DIM + KV_NOPE_NUM_FP32_SCALES;
     static constexpr uint32_t KV_PACKED_ROW_BYTES = KV_NOPE_INT8_DIM + KV_NOPE_NUM_FP32_SCALES * 4U;
     static constexpr uint32_t KV_PACKED_ROW_SIZE = KV_PACKED_ROW_BYTES;
+    // UB row stride for packed int8 rows (528B). Two ping-pong banks must fit in 32K:
+    // 2 * KV_MERGE_STAGE_ROWS * KV_MERGE_UB_ROW_STRIDE <= BUFFER_SIZE_BYTE_32K.
+    static constexpr uint32_t KV_MERGE_UB_ROW_STRIDE = KV_PACKED_ROW_SIZE;
+    static constexpr uint32_t KV_MERGE_STAGE_ROWS = 31U;
+    // 32-byte aligned scratch row for per-tile dequant (512 int8 + 16B fp32 scales + pad).
     static constexpr uint32_t KV_MERGE_STAGE_MAX_DIM = 544U;
+    static_assert(2U * KV_MERGE_STAGE_ROWS * KV_MERGE_UB_ROW_STRIDE <= ConstInfo::BUFFER_SIZE_BYTE_32K,
+                  "int8 kv merge ping-pong exceeds 32K inputBuff1 bank");
     static constexpr uint32_t KV_TILE_SIZE = 128U;
     static constexpr uint32_t KV_TILE_NUM = 4U;
     static constexpr uint32_t DQ_ALIGNED_ROW_BYTES = 544U;
@@ -938,7 +944,7 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyPackedKvRowsToUb(LocalTensor<
     intriParams.srcStride = 0;
     DataCopyPadExtParams<KV_INT8_T> padParams;
     for (uint32_t rowIdx = 0; rowIdx < rowCount; ++rowIdx) {
-        DataCopyPad(dstUb[rowIdx * KV_MERGE_STAGE_MAX_DIM], srcGm[rowIdx * KV_PACKED_ROW_SIZE], intriParams,
+        DataCopyPad(dstUb[rowIdx * KV_MERGE_UB_ROW_STRIDE], srcGm[rowIdx * KV_PACKED_ROW_SIZE], intriParams,
                     padParams);
     }
 }
@@ -954,7 +960,8 @@ SFAVectorService<SFAT>::CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int6
     int64_t validS2Count =
         (realS2Idx + constInfo.sparseBlockSize > s2IdLimit ? s2IdLimit - realS2Idx : constInfo.sparseBlockSize);
     const uint64_t ubRowBase =
-        mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * KV_MERGE_STAGE_MAX_DIM + (mte2Size - mte3Size) * KV_MERGE_STAGE_MAX_DIM;
+        mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * KV_MERGE_UB_ROW_STRIDE +
+        (mte2Size - mte3Size) * KV_MERGE_UB_ROW_STRIDE;
     CopyPackedKvRowsToUb(kvMergUb_[ubRowBase], keyGm_[keyBNBOffset * KV_PACKED_ROW_BYTES],
                          static_cast<uint32_t>(validS2Count));
 
@@ -964,7 +971,8 @@ SFAVectorService<SFAT>::CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int6
     intriParams.dstStride = 0;
     intriParams.srcStride = 0;
     DataCopyPadExtParams<KV_T> ropePadParams;
-    DataCopyPad(ropeMergUb_[mergeMte3Idx % 2 * 32 * 64 + (mte2Size - mte3Size) * constInfo.headDimRope],
+    DataCopyPad(ropeMergUb_[mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * constInfo.headDimRope +
+                            (mte2Size - mte3Size) * constInfo.headDimRope],
                 keyRopeGm_[keyBNBOffset * constInfo.headDimRope], intriParams, ropePadParams);
     mte2Size += validS2Count;
 }
@@ -1013,7 +1021,8 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInKv(int64_t &mte2Size, int64
     } else {
         const uint32_t sparseBlockSize = constInfo.sparseBlockSize;
         uint64_t ubRowBase =
-            mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * KV_MERGE_STAGE_MAX_DIM + (mte2Size - mte3Size) * KV_MERGE_STAGE_MAX_DIM;
+            mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * KV_MERGE_UB_ROW_STRIDE +
+            (mte2Size - mte3Size) * KV_MERGE_UB_ROW_STRIDE;
         int64_t firstKeyOffset = keyOffset1 > -1 ? keyOffset1 : keyOffset2;
         int64_t secondKeyOffset = -1;
         if (keyOffset1 > -1 && keyOffset2 > -1) {
@@ -1027,7 +1036,7 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInKv(int64_t &mte2Size, int64
         }
         CopyPackedKvRowsToUb(kvMergUb_[ubRowBase], keyGm_[firstKeyOffset * KV_PACKED_ROW_BYTES], sparseBlockSize);
         if (secondKeyOffset > -1) {
-            CopyPackedKvRowsToUb(kvMergUb_[ubRowBase + sparseBlockSize * KV_MERGE_STAGE_MAX_DIM],
+            CopyPackedKvRowsToUb(kvMergUb_[ubRowBase + sparseBlockSize * KV_MERGE_UB_ROW_STRIDE],
                                  keyGm_[secondKeyOffset * KV_PACKED_ROW_BYTES], sparseBlockSize);
         }
 
@@ -1046,7 +1055,8 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInKv(int64_t &mte2Size, int64
         intriParams.dstStride = 0;
         intriParams.srcStride = keyRopeSrcStride;
         DataCopyPadExtParams<KV_T> ropePadParams;
-        DataCopyPad(ropeMergUb_[mergeMte3Idx % 2 * 32 * 64 + (mte2Size - mte3Size) * constInfo.headDimRope],
+        DataCopyPad(ropeMergUb_[mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * constInfo.headDimRope +
+                                (mte2Size - mte3Size) * constInfo.headDimRope],
                     keyRopeGm_[startRopeOffset * constInfo.headDimRope], intriParams, ropePadParams);
         mte2Size += ((keyOffset1 > -1) + (keyOffset2 > -1)) * sparseBlockSize;
     }
@@ -1066,10 +1076,10 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyOutMrgeResult(int64_t mte2Siz
     WaitFlag<AscendC::HardEvent::MTE2_V>(0);
 
     int64_t rowCount = mte2Size - mte3Size;
-    const uint64_t ubRowBase = mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * KV_MERGE_STAGE_MAX_DIM;
+    const uint64_t ubRowBase = mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * KV_MERGE_UB_ROW_STRIDE;
     LocalTensor<KV_T> mergeOutUb = outputBuff1.Get<KV_T>();
     for (int64_t rowIdx = 0; rowIdx < rowCount; ++rowIdx) {
-        LocalTensor<KV_INT8_T> srcInt8RowUb = kvMergUb_[ubRowBase + rowIdx * KV_MERGE_STAGE_MAX_DIM];
+        LocalTensor<KV_INT8_T> srcInt8RowUb = kvMergUb_[ubRowBase + rowIdx * KV_MERGE_UB_ROW_STRIDE];
         LocalTensor<KV_T> dstRowUb = mergeOutUb[rowIdx * constInfo.headDim];
         DequantInt8RowPerTile(dstRowUb, srcInt8RowUb, constInfo.headDim);
     }
@@ -1086,7 +1096,8 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyOutMrgeResult(int64_t mte2Siz
 
     dataCopyParams.blockLen = constInfo.headDimRope * sizeof(KV_T);
     DataCopyPad(kvMergeGm_[runInfo.loop % 4 * 512 * 576 + 512 * 512 + (s2GmStartOffset + mte3Size) *
-                constInfo.headDimRope], ropeMergUb_[mergeMte3Idx % 2 * 32 * 64], dataCopyParams);
+                constInfo.headDimRope],
+                ropeMergUb_[mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * constInfo.headDimRope], dataCopyParams);
 }
 
 // b s1 k
@@ -1132,7 +1143,7 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
         }
         GetRealS2Idx(s2GmOffsetArray + constInfo.sparseBlockSize, s2IdxArray1, topkGmBaseOffset, runInfo);
         CopyInKv(mte2Size, mte3Size, mergeMte3Idx, s2IdxArray0, s2IdxArray1, runInfo);
-        if ((mte2Size - mte3Size + 2 * constInfo.sparseBlockSize > 32) ||
+        if ((mte2Size - mte3Size + 2 * constInfo.sparseBlockSize > static_cast<int64_t>(KV_MERGE_STAGE_ROWS)) ||
             s2GmOffsetArray + 2 * constInfo.sparseBlockSize >= s2GmLimit) {
             CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, runInfo);
             mte3Size = mte2Size;

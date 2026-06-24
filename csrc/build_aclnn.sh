@@ -256,6 +256,9 @@ invalidate_stale_opc_artifacts() {
     # opc stamps and copied src trees so syntax fixes are not masked by stale artifacts.
     if [[ -d "${bin_gen}" ]]; then
         rm -f "${bin_gen}"/*.done
+        # Stale kernel_meta_* dirs leave kernel_meta.lock behind and cause
+        # "Another process is using this dir" on parallel TBE/opc builds.
+        rm -rf "${bin_gen}"/kernel_meta_*
     fi
 
     if [[ -d "${bin_src}" ]]; then
