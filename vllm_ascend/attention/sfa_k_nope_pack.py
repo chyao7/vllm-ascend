@@ -73,6 +73,7 @@ def quantize_k_nope_per_group(k_nope: torch.Tensor) -> torch.Tensor:
 
 def dequantize_packed_k_nope(packed: torch.Tensor) -> torch.Tensor:
     """Dequantize packed k_nope rows back to float32 [..., kv_lora_rank]."""
+    orig_shape = packed.shape[:-1]
     packed = packed.reshape(-1, K_NOPE_PACKED_BYTES)
     k_int8 = packed[:, :K_NOPE_INT8_DIM].to(torch.float32)
     scales = packed[:, K_NOPE_INT8_DIM :].view(torch.float32)
@@ -81,7 +82,7 @@ def dequantize_packed_k_nope(packed: torch.Tensor) -> torch.Tensor:
         start = tile_idx * K_NOPE_TILE_SIZE
         end = start + K_NOPE_TILE_SIZE
         dequant[:, start:end] = k_int8[:, start:end] * scales[:, tile_idx : tile_idx + 1]
-    return dequant.view(*packed.shape[:-1], K_NOPE_INT8_DIM)
+    return dequant.view(*orig_shape, K_NOPE_INT8_DIM)
 
 
 def scatter_packed_k_nope_to_cache(

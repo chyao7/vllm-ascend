@@ -344,6 +344,8 @@ def _run_bf16_sfa_dequant_baseline(prepared: PreparedCase) -> torch.Tensor:
     k_dequant = dequantize_packed_k_nope(prepared.k_nope_int8.view(torch.uint8)).to(
         prepared.k_nope_bf16.dtype
     )
+    if k_dequant.shape != prepared.k_nope_bf16.shape:
+        k_dequant = k_dequant.reshape(prepared.k_nope_bf16.shape)
     out, _, _ = torch.ops._C_ascend.npu_sparse_flash_attention(
         query=prepared.ql_nope,
         key=k_dequant,
