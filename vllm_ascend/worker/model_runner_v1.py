@@ -80,7 +80,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.worker.utils import select_common_block_size
 
-from vllm_ascend.attention.sfa_k_nope_pack import K_NOPE_SCALE_METADATA_BYTES
+from vllm_ascend.attention.sfa_k_nope_pack import K_NOPE_PACKED_DIM, K_NOPE_PACKED_ROW_BYTES
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, vllm_version_is
 
 if vllm_version_is("0.21.0"):
@@ -374,7 +374,7 @@ class NPUModelRunner(GPUModelRunner):
                 # 910B sparse C8: packed int8 kv_lora + fp32 scales in kv_cache[0].
                 kv_lora_rank = self.model_config.hf_text_config.kv_lora_rank
                 self.sparse_head_dim = (
-                    kv_lora_rank + K_NOPE_SCALE_METADATA_BYTES,
+                    K_NOPE_PACKED_DIM,
                     self.model_config.hf_text_config.qk_rope_head_dim,
                     self.model_config.hf_text_config.index_head_dim,
                 )
@@ -4379,8 +4379,7 @@ class NPUModelRunner(GPUModelRunner):
                                 mla_num_blocks,
                                 mla_block_size,
                                 num_kv_heads,
-                                self.model_config.hf_text_config.kv_lora_rank
-                                + K_NOPE_SCALE_METADATA_BYTES,
+                                K_NOPE_PACKED_ROW_BYTES,
                             )
                         v_shape = (
                             mla_num_blocks,

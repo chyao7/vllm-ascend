@@ -1332,11 +1332,16 @@ ge::graphStatus SFATilingCheck::CheckFeatureMlaNoQuantShape() const
         OP_LOGE(opName_, "qk_head_dim only support 512, but got %u", qkHeadDim_),
         return ge::GRAPH_FAILED);
 
-    OP_CHECK_IF(kvStorageDim_ != 528,
-        OP_LOGE(opName_, "packed kv storage dim should be 528, but got %u", kvStorageDim_),
+    // Logical D=516 (512 int8 + 4 fp32 scales). PyTorch int8 cache may report D=528 bytes.
+    OP_CHECK_IF(kvStorageDim_ != 516 && kvStorageDim_ != 528,
+        OP_LOGE(opName_,
+            "packed kv storage dim should be 516 (512 int8 + 4 fp32) or 528 (int8 byte view), but got %u",
+            kvStorageDim_),
         return ge::GRAPH_FAILED);
-    OP_CHECK_IF(vHeadDim_ != 528,
-        OP_LOGE(opName_, "packed value storage dim should be 528, but got %u", vHeadDim_),
+    OP_CHECK_IF(vHeadDim_ != 516 && vHeadDim_ != 528,
+        OP_LOGE(opName_,
+            "packed value storage dim should be 516 (512 int8 + 4 fp32) or 528 (int8 byte view), but got %u",
+            vHeadDim_),
         return ge::GRAPH_FAILED);
 
     OP_CHECK_IF(ropeHeadDim_ != 64,

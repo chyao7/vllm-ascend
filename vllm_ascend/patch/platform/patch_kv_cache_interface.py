@@ -16,8 +16,8 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.attention.sfa_k_nope_pack import (
-    K_NOPE_PACKED_BYTES,
-    K_NOPE_SCALE_METADATA_BYTES,
+    K_NOPE_PACKED_DIM,
+    K_NOPE_PACKED_ROW_BYTES,
 )
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
@@ -40,8 +40,8 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     (kv_cache[0]: bfloat16, kv_cache[1]: bfloat16, kv_cache[2]: int8, kv_cache[3]: float16).
 
     On 910B with Sparse C8, kv_cache[0] stores packed int8 kv_lora plus fp32
-    per-tile scale metadata (512 + 16 = 528 bytes per token). kv_cache[1]
-    still stores k_rope in bf16.
+    per-tile scale metadata (logical D=516 = 512 int8 + 4 fp32; 528 bytes/token).
+    kv_cache[1] still stores k_rope in bf16.
 
     The semantic meaning of each KV cache entry is as follows:
     1. kv_cache[0] stores kv_lora (bf16 by default, packed int8+scale on 910B C8).
@@ -83,14 +83,10 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
                 kv_bytes = num_heads_per_page * kv_dim * get_dtype_size(kv_dtype)
             elif (
                 get_ascend_device_type() != AscendDeviceType.A5
-                and packed_k_nope_dim == K_NOPE_PACKED_BYTES
+                and packed_k_nope_dim == K_NOPE_PACKED_DIM
             ):
                 # 910B: packed int8 kv_lora + fp32 scales in kv_cache[0], bf16 k_rope in [1].
-                knope_bytes = (
-                    num_heads_per_page
-                    * packed_k_nope_dim
-                    * get_dtype_size(self.c8_k_cache_dtype)
-                )
+                knope_bytes = num_heads_per_page * K_NOPE_PACKED_ROW_BYTES
                 rope_bytes = (
                     num_heads_per_page
                     * qk_rope_head_dim
@@ -143,10 +139,10 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
 
             if (
                 get_ascend_device_type() != AscendDeviceType.A5
-                and packed_k_nope_dim == K_NOPE_PACKED_BYTES
+                and packed_k_nope_dim == K_NOPE_PACKED_DIM
             ):
                 # 910B sparse C8: byte-normalized virtual dims for 4-tensor split.
-                knope_virtual = packed_k_nope_dim * get_dtype_size(self.c8_k_cache_dtype)
+                knope_virtual = K_NOPE_PACKED_ROW_BYTES
                 rope_virtual = qk_rope_head_dim * get_dtype_size(self.dtype)
                 qli_virtual = index_k_head_dim * get_dtype_size(self.c8_k_cache_dtype)
                 scale_virtual = get_dtype_size(self.c8_k_scale_cache_dtype)

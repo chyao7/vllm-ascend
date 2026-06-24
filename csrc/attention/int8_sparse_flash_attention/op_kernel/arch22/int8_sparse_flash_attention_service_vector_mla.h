@@ -132,8 +132,12 @@ public:
     // repeat stride不能超过256
     static constexpr uint32_t REPEATE_STRIDE_UP_BOUND = 256;
     static constexpr uint32_t KV_MERGE_STAGE_ROWS = 32U;
-    static constexpr uint32_t KV_PACKED_ROW_SIZE = 528U;
+    // Logical D=516 (512 int8 + 4 fp32 scales); physical row is 528 bytes in GM.
     static constexpr uint32_t KV_NOPE_INT8_DIM = 512U;
+    static constexpr uint32_t KV_NOPE_NUM_FP32_SCALES = 4U;
+    static constexpr uint32_t KV_PACKED_LOGICAL_DIM = KV_NOPE_INT8_DIM + KV_NOPE_NUM_FP32_SCALES;
+    static constexpr uint32_t KV_PACKED_ROW_BYTES = KV_NOPE_INT8_DIM + KV_NOPE_NUM_FP32_SCALES * 4U;
+    static constexpr uint32_t KV_PACKED_ROW_SIZE = KV_PACKED_ROW_BYTES;
     static constexpr uint32_t KV_MERGE_STAGE_MAX_DIM = 544U;
     static constexpr uint32_t KV_TILE_SIZE = 128U;
     static constexpr uint32_t KV_TILE_NUM = 4U;
@@ -865,8 +869,8 @@ __aicore__ inline int64_t SFAVectorService<SFAT>::GetKeyGmOffset(int64_t realS2I
                                 blkTableOffset;
     } else {
         realKeyGmOffset = (runInfo.tensorBOffset +
-                           realS2Idx * constInfo.kvHeadNum * constInfo.kvStorageDim) /
-                           constInfo.kvStorageDim;
+                           realS2Idx * constInfo.kvHeadNum * KV_PACKED_ROW_BYTES) /
+                           KV_PACKED_ROW_BYTES;
     }
     return realKeyGmOffset;
 }
@@ -943,10 +947,9 @@ SFAVectorService<SFAT>::CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int6
     }
     int64_t validS2Count =
         (realS2Idx + constInfo.sparseBlockSize > s2IdLimit ? s2IdLimit - realS2Idx : constInfo.sparseBlockSize);
-    const uint64_t kvGmStride = constInfo.kvStorageDim;
     const uint64_t ubRowBase =
         mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * KV_MERGE_STAGE_MAX_DIM + (mte2Size - mte3Size) * KV_MERGE_STAGE_MAX_DIM;
-    CopyPackedKvRowsToUb(kvMergUb_[ubRowBase], keyGm_[keyBNBOffset * kvGmStride],
+    CopyPackedKvRowsToUb(kvMergUb_[ubRowBase], keyGm_[keyBNBOffset * KV_PACKED_ROW_BYTES],
                          static_cast<uint32_t>(validS2Count));
 
     DataCopyExtParams intriParams;
@@ -981,13 +984,13 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInKv(int64_t &mte2Size, int64
         int64_t blkTableSrcStride =
         ((keyOffset1 > keyOffset2 ? (keyOffset1 - keyOffset2) :
         (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize);
-        keySrcStride = blkTableSrcStride * constInfo.kvStorageDim * sizeof(KV_INT8_T);
+        keySrcStride = blkTableSrcStride * KV_PACKED_ROW_BYTES * sizeof(KV_INT8_T);
         keyRopeSrcStride = blkTableSrcStride * constInfo.headDimRope * sizeof(KV_T);
     } else {
         int64_t keyRopeOffset1 = GetKeyRopeGmOffset(realS2Idx1, runInfo, s2IdLimit);
         int64_t keyRopeOffset2 = GetKeyRopeGmOffset(realS2Idx2, runInfo, s2IdLimit);
         keySrcStride = ((keyOffset1 > keyOffset2 ? (keyOffset1 - keyOffset2) :
-                        (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize) * constInfo.kvStorageDim *
+                        (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize) * KV_PACKED_ROW_BYTES *
                         sizeof(KV_INT8_T);
         keyRopeSrcStride = ((keyRopeOffset1 > keyRopeOffset2 ? (keyRopeOffset1 - keyRopeOffset2) :
                             (keyRopeOffset2 - keyRopeOffset1)) - constInfo.sparseBlockSize) *
@@ -1002,7 +1005,6 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInKv(int64_t &mte2Size, int64
         CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx1, keyOffset1, s2IdLimit, runInfo);
         CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx2, keyOffset2, s2IdLimit, runInfo);
     } else {
-        const uint64_t kvGmStride = constInfo.kvStorageDim;
         const uint32_t sparseBlockSize = constInfo.sparseBlockSize;
         uint64_t ubRowBase =
             mergeMte3Idx % 2 * KV_MERGE_STAGE_ROWS * KV_MERGE_STAGE_MAX_DIM + (mte2Size - mte3Size) * KV_MERGE_STAGE_MAX_DIM;
@@ -1017,10 +1019,10 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInKv(int64_t &mte2Size, int64
                 secondKeyOffset = keyOffset1;
             }
         }
-        CopyPackedKvRowsToUb(kvMergUb_[ubRowBase], keyGm_[firstKeyOffset * kvGmStride], sparseBlockSize);
+        CopyPackedKvRowsToUb(kvMergUb_[ubRowBase], keyGm_[firstKeyOffset * KV_PACKED_ROW_BYTES], sparseBlockSize);
         if (secondKeyOffset > -1) {
             CopyPackedKvRowsToUb(kvMergUb_[ubRowBase + sparseBlockSize * KV_MERGE_STAGE_MAX_DIM],
-                                 keyGm_[secondKeyOffset * kvGmStride], sparseBlockSize);
+                                 keyGm_[secondKeyOffset * KV_PACKED_ROW_BYTES], sparseBlockSize);
         }
 
         int64_t startRopeOffset = firstKeyOffset;

@@ -7,7 +7,7 @@ Ascend **910B** sparse flash attention with **packed int8 KV nope**, **bf16/fp16
 For each gathered KV token:
 
 ```text
-# Packed layout (key D=528 = 512 int8 + 16B fp32 scales):
+# Packed layout (logical D=516 = 512 int8 + 4 fp32 scales; 528 bytes/row):
 scale[g] = fp32 at byte offset 512 + g*4
 kv_dequant[tile g] = int8[tile g] * scale[g]
 
@@ -29,12 +29,12 @@ Rope (D=64) is **not quantized** and is copied as bf16/fp16 from `key_rope`.
 |------|-------|-------------------------|-------|
 | query | fp16/bf16 | `(T, N1, 512)` TND | nope |
 | query_rope | fp16/bf16 | `(T, N1, 64)` | required |
-| key | **int8** | `(block_num, block_size, 1, 528)` | packed nope cache |
+| key | **int8** | `(block_num, block_size, 1, 528)` | packed nope cache (logical D=516) |
 | value | **int8** | same as key | shared KV |
 | key_rope | fp16/bf16 | `(block_num, block_size, 1, 64)` | not quantized |
 | sparse_indices | int32 | `(T, 1, topk)` | from lightning_indexer |
 
-Packed layout (910B sparse C8): last dim **528** = 512 int8 + 4×fp32 per-token scales.
+Packed layout (910B sparse C8): logical **D=516** = 512 int8 + 4 fp32 scales; **528 bytes** per row in torch.int8 cache.
 
 ## Attributes
 

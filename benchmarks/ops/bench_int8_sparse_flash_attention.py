@@ -7,7 +7,8 @@ Targets ``csrc/attention/int8_sparse_flash_attention`` (910B only):
   - **bf16 baseline**: ``torch.ops._C_ascend.npu_sparse_flash_attention``
   - **int8**: ``torch.ops._C_ascend.npu_int8_sparse_flash_attention``
 
-KV nope uses packed 910B sparse C8 layout: D=528 = 512 int8 + 4 fp32 per-tile scales.
+KV nope uses packed 910B sparse C8 layout: logical D=516 (512 int8 + 4 fp32 scales),
+physical row = 528 bytes when viewed as torch.int8.
 Rope (D=64) stays bf16/fp16. Shapes follow production SFA (TND query, PA_BSND KV).
 
 Example:
@@ -35,6 +36,8 @@ import vllm_ascend.platform  # noqa: F401
 from vllm_ascend.attention.sfa_k_nope_pack import (
     K_NOPE_INT8_DIM,
     K_NOPE_PACKED_BYTES,
+    K_NOPE_PACKED_DIM,
+    K_NOPE_PACKED_ROW_BYTES,
     dequantize_packed_k_nope,
     quantize_k_nope_per_group,
 )
@@ -265,7 +268,7 @@ def _dequant_kv_from_packed(packed: torch.Tensor, ref_shape: torch.Size, dtype: 
 
 
 def _quantize_kv_packed_per_tile(kv_bf16: torch.Tensor) -> torch.Tensor:
-    """Pack 512-dim k_nope rows into 528-byte int8 cache rows (910B sparse C8)."""
+    """Pack 512-dim k_nope rows into 528-byte int8 cache rows (logical D=516)."""
     *prefix, dim = kv_bf16.shape
     if dim != K_NOPE_INT8_DIM:
         raise ValueError(f"packed quant expects kv_lora_rank={K_NOPE_INT8_DIM}, got {dim}")
@@ -457,7 +460,7 @@ def _print_header(device_type: AscendDeviceType) -> None:
     print("  op source    : csrc/attention/int8_sparse_flash_attention")
     print(f"  device_type  : {device_type.name}")
     print("  bf16 op      : npu_sparse_flash_attention")
-    print("  int8 op      : npu_int8_sparse_flash_attention (910B packed D=528)")
+    print("  int8 op      : npu_int8_sparse_flash_attention (910B packed D=516, 528B row)")
     print(f"  kv_lora_rank : {DEEPSEEK_V32_SFA['kv_lora_rank']}")
     print(f"  rope_dim     : {DEEPSEEK_V32_SFA['qk_rope_head_dim']}")
     print(f"  index_topk   : {DEEPSEEK_V32_SFA['index_topk']}")
@@ -673,7 +676,8 @@ def main() -> int:
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "device_type": device_type.name,
             "op_source": "csrc/attention/int8_sparse_flash_attention",
-            "kv_storage_dim": K_NOPE_PACKED_BYTES,
+            "kv_storage_dim": K_NOPE_PACKED_DIM,
+            "kv_row_bytes": K_NOPE_PACKED_ROW_BYTES,
             "config": DEEPSEEK_V32_SFA,
             "args": vars(args),
             "accuracy": [asdict(r) for r in accuracy_results],

@@ -11,7 +11,7 @@
 /*!
  * \file int8_sparse_flash_attention_def.cpp
  * \brief Int8 KV sparse flash attention for Ascend 910B.
- *        KV nope uses packed int8 layout (D=528): 512 int8 + 4 fp32 per-tile scales.
+ *        KV nope uses packed int8 layout (logical D=516): 512 int8 + 4 fp32 per-tile scales (528 bytes/row).
  *        KV rope stays bf16/fp16 and is not quantized.
  */
 

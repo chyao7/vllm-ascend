@@ -3,7 +3,7 @@
 
 import torch
 
-from vllm_ascend.attention.sfa_k_nope_pack import K_NOPE_PACKED_BYTES
+from vllm_ascend.attention.sfa_k_nope_pack import K_NOPE_PACKED_DIM, K_NOPE_PACKED_ROW_BYTES
 from vllm_ascend.patch.platform.patch_kv_cache_interface import AscendMLAAttentionSpec
 
 
@@ -11,8 +11,8 @@ def test_910b_sparse_c8_page_size_and_ratio():
     spec = AscendMLAAttentionSpec(
         block_size=128,
         num_kv_heads=1,
-        head_size=K_NOPE_PACKED_BYTES + 64 + 128,
-        sparse_head_dim=(K_NOPE_PACKED_BYTES, 64, 128),
+        head_size=K_NOPE_PACKED_ROW_BYTES + 64 + 128,
+        sparse_head_dim=(K_NOPE_PACKED_DIM, 64, 128),
         dtype=torch.bfloat16,
         cache_dtype_str="auto",
         cache_sparse_c8=True,

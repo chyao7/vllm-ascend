@@ -11,8 +11,14 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 K_NOPE_INT8_DIM = 512
 K_NOPE_TILE_SIZE = 128
 K_NOPE_NUM_TILES = K_NOPE_INT8_DIM // K_NOPE_TILE_SIZE
-K_NOPE_SCALE_METADATA_BYTES = K_NOPE_NUM_TILES * 4
-K_NOPE_PACKED_BYTES = K_NOPE_INT8_DIM + K_NOPE_SCALE_METADATA_BYTES
+K_NOPE_NUM_FP32_SCALES = K_NOPE_NUM_TILES
+# Logical packed dim for sparse_head_dim / CANN D axis: 512 int8 + 4 fp32 scales.
+K_NOPE_PACKED_DIM = K_NOPE_INT8_DIM + K_NOPE_NUM_FP32_SCALES
+# Physical row size in bytes (512 int8 bytes + 4 fp32 * 4 bytes).
+K_NOPE_SCALE_METADATA_BYTES = K_NOPE_NUM_FP32_SCALES * 4
+K_NOPE_PACKED_ROW_BYTES = K_NOPE_INT8_DIM + K_NOPE_SCALE_METADATA_BYTES
+# Alias kept for int8 tensor last dim (528-byte rows viewed as torch.int8).
+K_NOPE_PACKED_BYTES = K_NOPE_PACKED_ROW_BYTES
 INT8_MAX = 127.0
 
 
@@ -30,7 +36,7 @@ def is_packed_k_nope_sparse_head_dim(
     packed_k_nope_dim, qk_rope_head_dim, _ = sparse_head_dim
     return (
         qk_rope_head_dim != 0
-        and packed_k_nope_dim == kv_lora_rank + K_NOPE_SCALE_METADATA_BYTES
+        and packed_k_nope_dim == kv_lora_rank + K_NOPE_NUM_FP32_SCALES
     )
 
 

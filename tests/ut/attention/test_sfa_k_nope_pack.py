@@ -6,7 +6,6 @@ import torch
 from vllm_ascend.attention.sfa_k_nope_pack import (
     K_NOPE_INT8_DIM,
     K_NOPE_PACKED_BYTES,
-    K_NOPE_SCALE_METADATA_BYTES,
     dequantize_packed_k_nope,
     is_packed_k_nope_sparse_head_dim,
     quantize_k_nope_per_group,
@@ -25,7 +24,8 @@ def test_quantize_dequantize_roundtrip():
 
 
 def test_is_packed_k_nope_sparse_head_dim():
-    assert is_packed_k_nope_sparse_head_dim((528, 64, 128), kv_lora_rank=512)
+    assert is_packed_k_nope_sparse_head_dim((516, 64, 128), kv_lora_rank=512)
+    assert not is_packed_k_nope_sparse_head_dim((528, 64, 128), kv_lora_rank=512)
     assert not is_packed_k_nope_sparse_head_dim((512, 64, 128), kv_lora_rank=512)
     assert not is_packed_k_nope_sparse_head_dim((600, 0, 128), kv_lora_rank=512)
 
