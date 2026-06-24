@@ -1064,7 +1064,8 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyOutMrgeResult(int64_t mte2Siz
     LocalTensor<KV_T> mergeOutUb = outputBuff1.Get<KV_T>();
     for (int64_t rowIdx = 0; rowIdx < rowCount; ++rowIdx) {
         LocalTensor<KV_INT8_T> srcInt8RowUb = kvMergUb_[ubRowBase + rowIdx * KV_MERGE_STAGE_MAX_DIM];
-        DequantInt8RowPerTile(mergeOutUb[rowIdx * constInfo.headDim], srcInt8RowUb, constInfo.headDim);
+        LocalTensor<KV_T> dstRowUb = mergeOutUb[rowIdx * constInfo.headDim];
+        DequantInt8RowPerTile(dstRowUb, srcInt8RowUb, constInfo.headDim);
     }
     SetFlag<AscendC::HardEvent::V_MTE3>(0);
     WaitFlag<AscendC::HardEvent::V_MTE3>(0);
