@@ -9,6 +9,10 @@ from vllm.logger import logger
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.models.utils import extract_layer_index
 
+# Set by model_runner before graph capture to avoid launching HCCL
+# async broadcasts on streams not joined to the capture stream.
+_IN_GRAPH_CAPTURE = False
+
 from vllm_ascend.distributed.parallel_state import get_shard_weight_group
 
 
@@ -121,7 +125,7 @@ class SeriesMetadata:
 
     def reach_layer(self, layer_idx: int):
         # The index of the layer to be prefetched.
-        next_layer_idx = (layer_idx + self.prefetch_step) % self.num_layers + self.start_layer
+        next_layer_idx = (layer_idx - self.start_layer + self.prefetch_step) % self.num_layers + self.start_layer
         next_layer = self.layers[next_layer_idx - self.start_layer]
         # The index of the window to store the weight for the coming layer.
         next_layer.window_idx = self.window_offset
@@ -131,22 +135,43 @@ class SeriesMetadata:
             next_layer.weight.set_(window.weight)
         # Update `window_offset` by rolling one step.
         self.window_offset = (self.window_offset + 1) % (self.prefetch_step + 1)
-        assert window.data_layer_idx != next_layer_idx
+        if window.data_layer_idx == next_layer_idx and window.work is not None:
+            # Window still holds an un-consumed prefetch for the same layer.
+            # This can happen when profiling runs interleave reach_layer calls
+            # from different attention backends (SFA / MLA).  Wait for the
+            # in-flight broadcast to finish and reuse the window.
+            window.work.wait()
+            window.work = None
         window.data_layer_idx = next_layer_idx
-        # Start asynchronous broadcast work.
-        window.work = dist.broadcast(
-            next_layer.weight,
-            src=self.group.ranks[next_layer_idx % self.group.world_size],
-            group=self.group.device_group,
-            async_op=True,
-        )
+        # Start asynchronous broadcast work.  During ACL graph capture
+        # the broadcast runs on the HCCL stream which is not joined to
+        # the capture stream; skip it here — the pre-capture flush
+        # (flush_all_shard_weight_broadcasts) already stabilised weights.
+        global _IN_GRAPH_CAPTURE
+        if not _IN_GRAPH_CAPTURE:
+            window.work = dist.broadcast(
+                next_layer.weight,
+                src=self.group.ranks[next_layer_idx % self.group.world_size],
+                group=self.group.device_group,
+                async_op=True,
+            )
 
     def wait_weight(self, layer_idx: int):
         # Find the asynchronous broadcast work and wait for it.
         assert self.shard_windows
-        window = self.shard_windows[self.layers[layer_idx - self.start_layer].window_idx]
-        # Make sure the data in the corresponding shard window is for the current layer.
-        assert window.data_layer_idx == layer_idx
+        src = self.group.ranks[layer_idx % self.group.world_size]
+        win_idx = self.layers[layer_idx - self.start_layer].window_idx
+        if win_idx < 0 or self.shard_windows[win_idx].data_layer_idx != layer_idx:
+            # reach_layer was never called for this layer or the prefetch
+            # window is out of sync (e.g. after a profiling run interleaved
+            # reach_layer calls from different attention backends).
+            # Fall back to a synchronous broadcast.
+            meta = self.layers[layer_idx - self.start_layer]
+            dist.broadcast(
+                meta.weight, src=src, group=self.group.device_group, async_op=False
+            )
+            return
+        window = self.shard_windows[win_idx]
         if window.work is not None:
             window.work.wait()
             window.work = None
@@ -266,6 +291,35 @@ def reach_layer_for_shard_weight_series(layer: LinearBase):
 def wait_layer_for_shard_weight_series(layer: LinearBase):
     ext = _layer_external_dict[id(layer)]
     ext.series.wait_weight(ext.layer_idx)
+
+
+def flush_all_shard_weight_broadcasts():
+    """Wait for all pending async weight broadcasts across all series.
+
+    Must be called before ACL graph capture to join HCCL streams with the
+    main compute stream.  Otherwise the graph capture will fail with
+    ``capture model contains a stream that was not joined to the original
+    stream`` (runtime error 107025).
+    """
+    global _series_dict
+    for series in _series_dict.values():
+        for window in series.shard_windows:
+            if window.work is not None:
+                window.work.wait()
+                window.work = None
+
+
+class graph_capture_guard:
+    """Context manager that suppresses async weight broadcasts during capture."""
+
+    def __enter__(self):
+        global _IN_GRAPH_CAPTURE
+        _IN_GRAPH_CAPTURE = True
+        return self
+
+    def __exit__(self, *args):
+        global _IN_GRAPH_CAPTURE
+        _IN_GRAPH_CAPTURE = False
 
 
 @lru_cache(maxsize=1)
