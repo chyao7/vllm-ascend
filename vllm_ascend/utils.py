@@ -126,7 +126,12 @@ def enable_sfa_dcp_replicated_indexer(vllm_config: VllmConfig | None = None) -> 
     if vllm_config is None:
         from vllm.config import get_current_vllm_config
 
-        vllm_config = get_current_vllm_config()
+        try:
+            vllm_config = get_current_vllm_config()
+        except AssertionError:
+            # Config context not set (e.g. during drafter dummy_run on
+            # decode nodes); DCP replicated indexer cannot apply.
+            return False
 
     parallel_config = vllm_config.parallel_config
     return (

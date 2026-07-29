@@ -108,6 +108,7 @@ from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBui
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
+from vllm_ascend.ops.layer_shard_linear import flush_all_shard_weight_broadcasts, graph_capture_guard
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     get_sfa_qsfa_packed_head_dim,
@@ -232,13 +233,19 @@ def graph_capture(device: torch.device):
     # we use nullcontext now
     maybe_ca_context = nullcontext()
 
+    # Flush all pending async weight broadcasts (layer_sharding) to join
+    # HCCL streams back to the main compute stream before graph capture.
+    # Without this, graph capture fails with "capture model contains a
+    # stream that was not joined to the original stream" (error 107025).
+    flush_all_shard_weight_broadcasts()
+
     # ensure all initialization operations complete before attempting to
     # capture the graph on another stream
     curr_stream = torch.npu.current_stream()
     if curr_stream != stream:
         stream.wait_stream(curr_stream)
 
-    with torch.npu.stream(stream), maybe_ca_context:
+    with torch.npu.stream(stream), maybe_ca_context, graph_capture_guard():
         yield graph_capture_context
 
 
@@ -2237,9 +2244,7 @@ class NPUModelRunner(GPUModelRunner):
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
         # Run forward pass
-        defer_kv_connector_finalize = self.speculative_config is not None and (
-            get_pp_group().is_last_rank or self.broadcast_pp_output
-        )
+        clear_kv_metadata = self.speculative_config is None
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2260,7 +2265,7 @@ class NPUModelRunner(GPUModelRunner):
             self.maybe_get_kv_connector_output(
                 scheduler_output,
                 **(
-                    {"defer_finalize": defer_kv_connector_finalize}
+                    {"defer_finalize": not clear_kv_metadata}
                 ),
             ) as kv_connector_output,
         ):
