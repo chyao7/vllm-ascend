@@ -451,6 +451,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
         return self.kv_sharing_target_layer_name or layer_name
 
     @staticmethod
+    def _query_lens_from_cumulative(actual_seq_lengths_q: list[int]) -> list[int]:
+        """Convert TND cumulative query endpoints to per-request lengths."""
+        query_lens: list[int] = []
+        previous = 0
+        for endpoint in actual_seq_lengths_q:
+            endpoint = int(endpoint)
+            if endpoint < previous:
+                raise ValueError(
+                    "actual_seq_lengths_q must be monotonically non-decreasing, "
+                    f"got {actual_seq_lengths_q}"
+                )
+            query_lens.append(endpoint - previous)
+            previous = endpoint
+        return query_lens
+
+    @staticmethod
     def update_graph_params(
         update_stream,
         forward_context,
@@ -772,8 +788,27 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             "value_antiquant_mode": 0,
                             "inner_precise": 1,
                         }
-                        input_layout = "BNSD"
-                        sparse_mode = 0
+                        input_layout = "BSND"
+                        batch_size = query.shape[0]
+                        query_lens = AscendAttentionBackendImpl._query_lens_from_cumulative(
+                            actual_seq_lengths_q
+                        )
+                        if len(query_lens) < batch_size:
+                            raise RuntimeError(
+                                "C8 FIA graph replay metadata has fewer requests than the captured query: "
+                                f"{len(query_lens)} < {batch_size}"
+                            )
+                        query_lens = query_lens[:batch_size]
+                        captured_query_len = query.shape[1]
+                        if any(query_len != captured_query_len for query_len in query_lens):
+                            raise RuntimeError(
+                                "C8 FIA full-graph replay requires uniform query lengths matching capture, "
+                                f"got {query_lens}, captured query length {captured_query_len}"
+                            )
+                        actual_seq_lengths_q = query_lens
+                        if captured_query_len == 1:
+                            attn_mask = None
+                            sparse_mode = 0
                     torch_npu.npu_fused_infer_attention_score.out(
                         query=query,
                         key=key_cache,
@@ -839,25 +874,47 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         extra_args = {}
         if self.enable_c8_quant and layer is not None:
+            query_lens = self._query_lens_from_cumulative(actual_seq_lengths_q)
+            if not query_lens or any(query_len <= 0 for query_len in query_lens):
+                raise RuntimeError(f"C8 FIA requires positive query lengths, got {query_lens}")
+            if len(query_lens) != len(actual_seq_lengths_kv):
+                raise RuntimeError(
+                    "C8 FIA query and KV metadata batch sizes differ: "
+                    f"{len(query_lens)} != {len(actual_seq_lengths_kv)}"
+                )
+            query_len = query_lens[0]
+            if any(current_query_len != query_len for current_query_len in query_lens):
+                raise RuntimeError(f"C8 FIA full-graph capture requires uniform query lengths, got {query_lens}")
+            if sum(query_lens) != num_tokens:
+                raise RuntimeError(
+                    f"C8 FIA query lengths sum to {sum(query_lens)}, but the graph contains {num_tokens} tokens"
+                )
+            if query_len > 1 and self.sliding_window is not None:
+                raise NotImplementedError("C8 multi-token decode with sliding-window attention is not supported")
+
             extra_args = {
-                "key_antiquant_scale": layer._c8_k_aq_scale_nz_bnsd,
-                "value_antiquant_scale": layer._c8_v_aq_scale_nz_bnsd,
+                "key_antiquant_scale": layer._c8_k_aq_scale_nz_bsnd,
+                "value_antiquant_scale": layer._c8_v_aq_scale_nz_bsnd,
                 "key_antiquant_mode": 0,
                 "value_antiquant_mode": 0,
                 "inner_precise": 1,
             }
 
-            # change key/value shape
+            # FIA V3 consumes the paged C8 KV cache in NZ 5D layout.
             _, block_size, _, _ = self.key_cache.shape  # type: ignore
             key = self._nz_5d_view(self.key_cache, block_size)
             value = self._nz_5d_view(self.value_cache, block_size)
 
-            # TODO: change layerout from BNSD to TND.
-            input_layout = "BNSD"
-            query = query.unsqueeze(2)
-            output = output.unsqueeze(2)
-            attn_mask = None
-            sparse_mode = 0
+            input_layout = "BSND"
+            batch_size = len(query_lens)
+            query = query[:num_tokens].view(batch_size, query_len, self.num_heads, self.head_size)
+            output = output[:num_tokens].view(batch_size, query_len, self.num_heads, self.head_size)
+            actual_seq_lengths_q = query_lens
+            if query_len == 1:
+                attn_mask = None
+                sparse_mode = 0
+            else:
+                sparse_mode = 3 if attn_metadata.causal else 0
         use_max_workspace = self._use_max_workspace_for_fia_graph
         workspace = graph_params.workspaces.get(num_tokens)
         should_update_workspace_cache = False
@@ -943,9 +1000,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         )
         if self.enable_c8_quant and layer is not None:
             attn_params = attn_params + (
-                weak_ref_tensors(layer._c8_k_aq_scale_nz_bnsd),
+                weak_ref_tensors(layer._c8_k_aq_scale_nz_bsnd),
                 None,
-                weak_ref_tensors(layer._c8_v_aq_scale_nz_bnsd),
+                weak_ref_tensors(layer._c8_v_aq_scale_nz_bsnd),
                 None,
             )  # type: ignore
         else:
@@ -1649,7 +1706,7 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
 
     def _prepare_c8_scales(self, layer: AttentionLayer, device: torch.device) -> None:
         """Shard per-channel C8 scales/offsets to this TP rank and pre-compute
-        BF16 BNSD antiquant tensors for FIA V1 decode fast path.
+        BF16 antiquant tensors for FIA V3 decode paths.
         """
         if hasattr(layer, "_c8_scales_prepared"):
             return
@@ -1679,6 +1736,9 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         nz_bnsd = (self.num_kv_heads, 1, self.head_size)
         layer._c8_k_aq_scale_nz_bnsd = layer._c8_k_scale.view(nz_bnsd).contiguous()
         layer._c8_v_aq_scale_nz_bnsd = layer._c8_v_scale.view(nz_bnsd).contiguous()
+        nz_bsnd = (self.num_kv_heads, self.head_size)
+        layer._c8_k_aq_scale_nz_bsnd = layer._c8_k_scale.view(nz_bsnd).contiguous()
+        layer._c8_v_aq_scale_nz_bsnd = layer._c8_v_scale.view(nz_bsnd).contiguous()
 
         layer._c8_scales_prepared = True
 
@@ -1753,6 +1813,133 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         ).to(torch.int8)
         return k_int8, v_int8
 
+    def _run_c8_decode_group(
+        self,
+        query_bsnd: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: list[int],
+        query_len: int,
+        attn_mask: torch.Tensor | None,
+        block_size: int,
+        layer: AttentionLayer,
+    ) -> torch.Tensor:
+        use_causal_mask = query_len > 1
+        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+            query_bsnd,
+            key,
+            value,
+            key_antiquant_scale=layer._c8_k_aq_scale_nz_bsnd,
+            value_antiquant_scale=layer._c8_v_aq_scale_nz_bsnd,
+            block_table=block_tables,
+            atten_mask=attn_mask if use_causal_mask else None,
+            actual_seq_lengths=[query_len] * len(seq_lens),
+            actual_seq_lengths_kv=seq_lens,
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            input_layout="BSND",
+            scale=self.scale,
+            block_size=block_size,
+            antiquant_mode=0,
+            key_antiquant_mode=0,
+            value_antiquant_mode=0,
+            inner_precise=1,
+            sparse_mode=3 if use_causal_mask else 0,
+            pre_tokens=SWA_INT_MAX,
+            next_tokens=SWA_INT_MAX,
+        )
+        return attn_output
+
+    def _forward_c8_decode_tokens(
+        self,
+        query: torch.Tensor,
+        query_lens: list[int],
+        block_tables: torch.Tensor,
+        seq_lens: list[int],
+        attn_mask: torch.Tensor | None,
+        output: torch.Tensor,
+        layer: AttentionLayer,
+    ) -> torch.Tensor:
+        if not query_lens or any(query_len <= 0 for query_len in query_lens):
+            raise ValueError(f"C8 FIA requires positive query lengths, got {query_lens}")
+        if len(query_lens) != len(seq_lens):
+            raise ValueError(
+                f"C8 FIA query and KV metadata batch sizes differ: {len(query_lens)} != {len(seq_lens)}"
+            )
+        if block_tables.shape[0] < len(query_lens):
+            raise ValueError(
+                "C8 FIA block table has fewer rows than requests: "
+                f"{block_tables.shape[0]} < {len(query_lens)}"
+            )
+        num_tokens = sum(query_lens)
+        if num_tokens > query.shape[0]:
+            raise ValueError(
+                f"C8 FIA query lengths require {num_tokens} tokens, but query only contains {query.shape[0]}"
+            )
+
+        _, block_size, _, _ = self.key_cache.shape  # type: ignore[attr-defined]
+        assert block_size % 32 == 0, (
+            f"C8 INT8 KV cache requires block_size to be a multiple of 32, got {block_size}"
+        )
+        max_query_len = max(query_lens)
+        if max_query_len > 1 and self.sliding_window is not None:
+            raise NotImplementedError("C8 multi-token decode with sliding-window attention is not supported")
+
+        key = self._nz_5d_view(self.key_cache, block_size)
+        value = self._nz_5d_view(self.value_cache, block_size)
+        if all(query_len == max_query_len for query_len in query_lens):
+            query_bsnd = query[:num_tokens].view(
+                len(query_lens), max_query_len, self.num_heads, self.head_size
+            )
+            attn_output = self._run_c8_decode_group(
+                query_bsnd,
+                key,
+                value,
+                block_tables[: len(query_lens)],
+                seq_lens,
+                max_query_len,
+                attn_mask,
+                block_size,
+                layer,
+            )
+            output[:num_tokens].copy_(attn_output.view(num_tokens, self.num_heads, self.head_size))
+            return output
+
+        groups: dict[int, list[tuple[int, int]]] = {}
+        token_offset = 0
+        for request_index, query_len in enumerate(query_lens):
+            groups.setdefault(query_len, []).append((request_index, token_offset))
+            token_offset += query_len
+
+        for query_len, requests in groups.items():
+            query_slices = [query[offset : offset + query_len] for _, offset in requests]
+            request_indices = [request_index for request_index, _ in requests]
+            if len(request_indices) == 1:
+                request_index = request_indices[0]
+                group_query = query_slices[0].view(1, query_len, self.num_heads, self.head_size)
+                group_block_tables = block_tables[request_index : request_index + 1]
+            else:
+                group_query = torch.cat(query_slices, dim=0).view(
+                    len(requests), query_len, self.num_heads, self.head_size
+                )
+                group_block_tables = torch.stack([block_tables[index] for index in request_indices])
+            group_seq_lens = [seq_lens[request_index] for request_index in request_indices]
+            group_output = self._run_c8_decode_group(
+                group_query,
+                key,
+                value,
+                group_block_tables,
+                group_seq_lens,
+                query_len,
+                attn_mask,
+                block_size,
+                layer,
+            )
+            for group_index, (_, offset) in enumerate(requests):
+                output[offset : offset + query_len].copy_(group_output[group_index])
+        return output
+
     def _forward_c8_decode(
         self,
         query: torch.Tensor,
@@ -1760,36 +1947,17 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         output: torch.Tensor,
         layer: AttentionLayer,
     ) -> torch.Tensor:
-        """C8 decode via FIA V1 BNSD with native paged INT8 KV + perchannel antiquant."""
-        num_block, block_size, _, _ = self.key_cache.shape  # type: ignore[attr-defined]
-        assert block_size % 32 == 0, f"C8 INT8 KV cache requires block_size to be a multiple of 32, got {block_size}"
-        batch_size = len(attn_metadata.seq_lens_list)
-
-        key = self._nz_5d_view(self.key_cache, block_size)
-        value = self._nz_5d_view(self.value_cache, block_size)
-
-        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
-            query[:batch_size].unsqueeze(2),
-            key,
-            value,
-            key_antiquant_scale=layer._c8_k_aq_scale_nz_bnsd,
-            value_antiquant_scale=layer._c8_v_aq_scale_nz_bnsd,
-            block_table=attn_metadata.block_tables,
-            actual_seq_lengths_kv=attn_metadata.seq_lens_list,
-            num_heads=self.num_heads,
-            num_key_value_heads=self.num_kv_heads,
-            input_layout="BNSD",
-            scale=self.scale,
-            block_size=block_size,
-            antiquant_mode=0,
-            key_antiquant_mode=0,
-            value_antiquant_mode=0,
-            inner_precise=1,
-            sparse_mode=0,
+        """C8 decode via FIA V3 BSND with native paged INT8 KV."""
+        query_lens = self._query_lens_from_cumulative(attn_metadata.actual_seq_lengths_q)
+        return self._forward_c8_decode_tokens(
+            query,
+            query_lens,
+            attn_metadata.block_tables,
+            attn_metadata.seq_lens_list,
+            attn_metadata.attn_mask,
+            output,
+            layer,
         )
-        attn_output = attn_output.squeeze(2)
-        output[:batch_size] = attn_output
-        return output
 
     def _forward_c8_chunked_prefill(
         self,
@@ -1800,7 +1968,7 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         output: torch.Tensor,
         layer: AttentionLayer,
     ) -> torch.Tensor:
-        """C8 ChunkedPrefill: decode via FIA V1 BNSD paged INT8 (zero gather),
+        """C8 ChunkedPrefill: decode via FIA V3 BSND paged INT8 (zero gather),
         prefill via FIA V1 TND with float KV (new) or gather+dequant (continuing).
         """
         num_decode_tokens = attn_metadata.num_decode_tokens
@@ -1809,33 +1977,16 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         num_tokens = int(actual_seq_qlen[-1])  # type: ignore[index]
 
         if num_decode_tokens > 0:
-            num_block, block_size, _, _ = self.key_cache.shape  # type: ignore[attr-defined]
-            assert block_size % 32 == 0, (
-                f"C8 INT8 KV cache requires block_size to be a multiple of 32, got {block_size}"
+            decode_query_lens = self._query_lens_from_cumulative(actual_seq_qlen[:num_decodes])
+            self._forward_c8_decode_tokens(
+                query[:num_decode_tokens],
+                decode_query_lens,
+                attn_metadata.block_tables[:num_decodes],
+                attn_metadata.seq_lens_list[:num_decodes],
+                attn_metadata.attn_mask,
+                output,
+                layer,
             )
-            kv_k = self._nz_5d_view(self.key_cache, block_size)
-            kv_v = self._nz_5d_view(self.value_cache, block_size)
-
-            attn_out, _ = torch_npu.npu_fused_infer_attention_score(
-                query[:num_decode_tokens].unsqueeze(2),
-                kv_k,
-                kv_v,
-                key_antiquant_scale=layer._c8_k_aq_scale_nz_bnsd,
-                value_antiquant_scale=layer._c8_v_aq_scale_nz_bnsd,
-                block_table=attn_metadata.block_tables[:num_decodes],
-                actual_seq_lengths_kv=attn_metadata.seq_lens_list[:num_decodes],
-                num_heads=self.num_heads,
-                num_key_value_heads=self.num_kv_heads,
-                input_layout="BNSD",
-                scale=self.scale,
-                block_size=block_size,
-                antiquant_mode=0,
-                key_antiquant_mode=0,
-                value_antiquant_mode=0,
-                inner_precise=1,
-                sparse_mode=0,
-            )
-            output[:num_decode_tokens] = attn_out.squeeze(2)
 
         if attn_metadata.num_prefills > 0:
             prefill_q = query[num_decode_tokens:num_tokens]
