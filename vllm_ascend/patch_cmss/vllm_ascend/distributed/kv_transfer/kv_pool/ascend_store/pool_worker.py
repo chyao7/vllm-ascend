@@ -520,7 +520,7 @@ class KVPoolWorker(_target.KVPoolWorker):
                     for chunk_hash, count in zip(chunk_hashes, variant_counts, strict=True):
                         values = res[offset : offset + count]  # type: ignore[index]
                         if values and all(value == 1 for value in values):
-                            exists.add((group_id, self._chunk_hash_to_bytes(chunk_hash)))
+                            exists.add((group_id, block_hash_to_bytes(chunk_hash)))
                         offset += count
                     logger.info(
                         "KV pool coordinator lookup group=%d exists_chunks=%d/%d",
@@ -550,12 +550,15 @@ class KVPoolWorker(_target.KVPoolWorker):
                 block_hashes: list[BlockHash],
                 kv_cache_group_ids: list[int] | None = None,
                 use_layerwise: bool = False,
+                hbm_hit_tokens: int = 0,
             ) -> int:
                 """
                 Checks the existence of KV cache of the tokens from the cache engine.
                 :param tokens: the input tokens, with shape [seq_len]
                 :return: An int indicating how many prefix tokens are cached.
                 """
+                # The d19 lookup RPC forwards hbm_hit_tokens. Keep the verified
+                # migrated behavior of checking the complete external prefix.
                 try:
                     hits: list[list[int]] = []
                     max_hit_position = self.max_model_len

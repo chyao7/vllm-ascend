@@ -35,19 +35,9 @@ if vllm_version_is("0.23.0"):
     import vllm_ascend.patch.platform.patch_glm47_tool_call_parser  # noqa
     import vllm_ascend.patch.platform.patch_minimax_m2_tool_call_parser  # noqa
     import vllm_ascend.patch.platform.patch_minimax_usage_accounting  # noqa
-from vllm_ascend.patch_cmss.vllm.entrypoints.openai.chat_completion.serving import (  # noqa: E402
-    apply as apply_cmss_chat_serving_patch,
-)
-from vllm_ascend.patch_cmss.vllm.entrypoints.openai.completion.serving import (  # noqa: E402
-    apply as apply_cmss_completion_serving_patch,
-)
-from vllm_ascend.patch_cmss.vllm.v1.engine.output_processor import (  # noqa: E402
-    apply as apply_cmss_output_processor_patch,
-)
+from vllm_ascend.patch_cmss import apply as apply_cmss_patch
 
-apply_cmss_output_processor_patch()
-apply_cmss_chat_serving_patch()
-apply_cmss_completion_serving_patch()
+apply_cmss_patch()
 
 import vllm_ascend.patch.platform.patch_deepseek_v4_tool_call_parser  # noqa
 import vllm_ascend.patch.platform.patch_structured_output  # noqa
