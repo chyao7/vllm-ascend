@@ -128,6 +128,8 @@ def rejection_random_sample_kernel(
     draft_probs_ptr,  # [num_tokens, vocab_size] or None
     target_probs_ptr,  # [num_tokens, vocab_size] or [num_tokens, selected_vocab_size] if ENABLE_REDUCE_SAMPLING
     target_indices_ptr,  # [num_tokens, selected_vocab_size] global vocab indices, only used if ENABLE_REDUCE_SAMPLING
+    target_max_probs_ptr,  # [num_tokens]
+    target_max_request_mask_ptr,  # [batch_size]
     bonus_token_ids_ptr,  # [batch_size]
     recovered_token_ids_ptr,  # [num_tokens]
     uniform_probs_ptr,  # [num_tokens]
@@ -137,9 +139,15 @@ def rejection_random_sample_kernel(
     global_vocab_size,  # global vocab size for draft_probs indexing (only used if ENABLE_REDUCE_SAMPLING)
     vec_len,
     ori_target_probs_ptr,  # [num_tokens, ori_vocab_size] original probs for entropy
+    NO_DRAFT_PROBS_TARGET_PROB_THRESHOLD,
+    NO_DRAFT_PROBS_ACCEPTANCE_BETA,
+    EAGLE3_ACCEPTANCE_ALPHA,
     NO_ORI_TARGET_PROBS: tl.constexpr,
     NO_DRAFT_PROBS: tl.constexpr,
     ENABLE_REDUCE_SAMPLING: tl.constexpr,  # Whether using reduce sampling
+    USE_TARGET_MAX_FOR_NO_DRAFT_PROBS: tl.constexpr,
+    USE_TARGET_MAX_REQUEST_MASK_FOR_NO_DRAFT_PROBS: tl.constexpr,
+    ADJUST_EAGLE3_ACCEPTANCE: tl.constexpr,
     ENTROPY_VERIFY: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     VOCAB_BLOCK_SIZE: tl.constexpr = 512,
@@ -164,6 +172,9 @@ def rejection_random_sample_kernel(
             start_idx = get_element(start_idxs, (req_i,))
             req_idx = block_idx * BLOCK_SIZE + req_i
             num_draft_tokens = get_element(n_num_draft_tokens, (req_i,))
+            use_target_max_for_req = USE_TARGET_MAX_FOR_NO_DRAFT_PROBS
+            if USE_TARGET_MAX_REQUEST_MASK_FOR_NO_DRAFT_PROBS:
+                use_target_max_for_req = tl.load(target_max_request_mask_ptr + req_idx)
 
             for pos in range(num_draft_tokens):
                 if not rejected:
@@ -171,7 +182,7 @@ def rejection_random_sample_kernel(
                         token_idx = start_idx + pos
                         draft_token_id = tl.load(draft_token_ids_ptr + token_idx)
 
-                        if draft_token_id == -1:
+                        if draft_token_id < 0:
                             rejected = True
                             token_id = tl.load(recovered_token_ids_ptr + token_idx)
                         else:
@@ -202,17 +213,68 @@ def rejection_random_sample_kernel(
                                         target_prob = current_match_prob
                                         found = True
 
-                            if NO_DRAFT_PROBS:
-                                draft_prob = 1
+                            if use_target_max_for_req:
+                                draft_prob = tl.load(target_max_probs_ptr + token_idx).to(tl.float32)
+                            elif NO_DRAFT_PROBS:
+                                draft_prob = 1.0
                             else:
-                                draft_prob = tl.load(draft_probs_ptr + token_idx * global_vocab_size + draft_token_id)
+                                draft_prob = tl.load(
+                                    draft_probs_ptr + token_idx * global_vocab_size + draft_token_id
+                                ).to(tl.float32)
 
                             uniform_prob = tl.load(uniform_probs_ptr + token_idx)
+                            if ADJUST_EAGLE3_ACCEPTANCE:
+                                uniform_prob = tl.where(
+                                    use_target_max_for_req,
+                                    uniform_prob,
+                                    uniform_prob / EAGLE3_ACCEPTANCE_ALPHA,
+                                )
+                            if ENTROPY_VERIFY and not use_target_max_for_req:
+                                loop = (vocab_size + SUB_BLOCK - 1) // SUB_BLOCK
+                                entropy = 0.0
+                                for loop_i in range(loop):
+                                    vocab_start = loop_i * SUB_BLOCK
+                                    vocab_offset = vocab_start + tl.arange(0, SUB_BLOCK)
+                                    vocab_mask = vocab_offset < vocab_size
+                                    probs = tl.load(
+                                        target_probs_ptr + token_idx * vocab_size + vocab_offset,
+                                        mask=vocab_mask,
+                                        other=0.0,
+                                    ).to(tl.float32)
+                                    log_probs = tl.log(probs + EPSILON)
+                                    entropy_contrib = -probs * log_probs
+                                    entropy += tl.sum(entropy_contrib)
+                                exp_neg_entropy = tl.exp(-entropy * POSTERIOR_ALPHA)
+                                threshold_by_entropy = exp_neg_entropy
+                                threshold = tl.minimum(threshold_by_entropy, POSTERIOR_THRESHOLD)
+                                uniform_prob = threshold * uniform_prob
 
                             # Acceptance condition
-                            if draft_prob > 0 and target_prob / draft_prob >= uniform_prob:
-                                # Accept
-                                token_id = draft_token_id
+                            if draft_prob > 0:
+                                acceptance_score = target_prob / draft_prob
+                                if use_target_max_for_req:
+                                    acceptance_score = (
+                                        acceptance_score
+                                        * NO_DRAFT_PROBS_ACCEPTANCE_BETA
+                                    )
+                                if acceptance_score >= uniform_prob:
+                                    if use_target_max_for_req:
+                                        if target_prob >= NO_DRAFT_PROBS_TARGET_PROB_THRESHOLD:
+                                            # Accept
+                                            token_id = draft_token_id
+                                        else:
+                                            # Reject - use recovered token
+                                            rejected = True
+                                            token_id = tl.load(
+                                                recovered_token_ids_ptr + token_idx
+                                            )
+                                    else:
+                                        # Accept
+                                        token_id = draft_token_id
+                                else:
+                                    # Reject - use recovered token
+                                    rejected = True
+                                    token_id = tl.load(recovered_token_ids_ptr + token_idx)
                             else:
                                 # Reject - use recovered token
                                 rejected = True
@@ -222,18 +284,30 @@ def rejection_random_sample_kernel(
                     else:
                         token_idx = start_idx + pos
                         draft_token_id = tl.load(draft_token_ids_ptr + token_idx)
-                        if draft_token_id == -1:
+                        if draft_token_id < 0:
                             rejected = True
                             token_id = tl.load(recovered_token_ids_ptr + token_idx)
                         else:
-                            target_prob = tl.load(target_probs_ptr + token_idx * global_vocab_size + draft_token_id)
-                            if NO_DRAFT_PROBS:
-                                draft_prob = 1
+                            target_prob = tl.load(
+                                target_probs_ptr + token_idx * global_vocab_size + draft_token_id
+                            ).to(tl.float32)
+                            if use_target_max_for_req:
+                                draft_prob = tl.load(target_max_probs_ptr + token_idx).to(tl.float32)
+                            elif NO_DRAFT_PROBS:
+                                draft_prob = 1.0
                             else:
-                                draft_prob = tl.load(draft_probs_ptr + token_idx * global_vocab_size + draft_token_id)
+                                draft_prob = tl.load(
+                                    draft_probs_ptr + token_idx * global_vocab_size + draft_token_id
+                                ).to(tl.float32)
                             uniform_prob = tl.load(uniform_probs_ptr + token_idx)
+                            if ADJUST_EAGLE3_ACCEPTANCE:
+                                uniform_prob = tl.where(
+                                    use_target_max_for_req,
+                                    uniform_prob,
+                                    uniform_prob / EAGLE3_ACCEPTANCE_ALPHA,
+                                )
 
-                            if ENTROPY_VERIFY:
+                            if ENTROPY_VERIFY and not use_target_max_for_req:
                                 loop = (vocab_size + SUB_BLOCK - 1) // SUB_BLOCK
                                 entropy = 0.0
                                 for loop_i in range(loop):
@@ -244,14 +318,14 @@ def rejection_random_sample_kernel(
                                         probs = tl.load(
                                             target_probs_ptr + token_idx * vocab_size + vocab_offset,
                                             vocab_mask,
-                                            other=0,
-                                        )
+                                            other=0.0,
+                                        ).to(tl.float32)
                                     else:
                                         probs = tl.load(
                                             ori_target_probs_ptr + token_idx * vocab_size + vocab_offset,
                                             vocab_mask,
-                                            other=0,
-                                        )
+                                            other=0.0,
+                                        ).to(tl.float32)
                                     log_probs = tl.log(probs + EPSILON)
                                     entropy_contrib = -probs * log_probs
                                     entropy += tl.sum(entropy_contrib)
@@ -264,9 +338,31 @@ def rejection_random_sample_kernel(
                                 _uniform_prob = uniform_prob
                             # NOTE(woosuk): While the draft probability should never be 0,
                             # we check it to avoid NaNs. If it happens to be 0, we reject.
-                            if draft_prob > 0 and target_prob / draft_prob >= _uniform_prob:
-                                # Accept.
-                                token_id = draft_token_id
+                            if draft_prob > 0:
+                                acceptance_score = target_prob / draft_prob
+                                if use_target_max_for_req:
+                                    acceptance_score = (
+                                        acceptance_score
+                                        * NO_DRAFT_PROBS_ACCEPTANCE_BETA
+                                    )
+                                if acceptance_score >= _uniform_prob:
+                                    if use_target_max_for_req:
+                                        if target_prob >= NO_DRAFT_PROBS_TARGET_PROB_THRESHOLD:
+                                            # Accept.
+                                            token_id = draft_token_id
+                                        else:
+                                            # Reject. Use recovered token.
+                                            rejected = True
+                                            token_id = tl.load(
+                                                recovered_token_ids_ptr + token_idx
+                                            )
+                                    else:
+                                        # Accept.
+                                        token_id = draft_token_id
+                                else:
+                                    # Reject. Use recovered token.
+                                    rejected = True
+                                    token_id = tl.load(recovered_token_ids_ptr + token_idx)
                             else:
                                 # Reject. Use recovered token.
                                 rejected = True
@@ -321,10 +417,12 @@ def sample_recovered_tokens_kernel(
     target_probs_ptr,
     target_indices_ptr,
     q_ptr,
+    target_max_request_mask_ptr,
     vocab_size,
     global_vocab_size,
     NO_DRAFT_PROBS: tl.constexpr,
     ENABLE_REDUCE_SAMPLING: tl.constexpr,
+    USE_TARGET_MAX_REQUEST_MASK_FOR_NO_DRAFT_PROBS: tl.constexpr,
     SUB_BLOCK: tl.constexpr,
     VOCAB_BLOCK_SIZE: tl.constexpr = 512,
 ):
@@ -340,6 +438,9 @@ def sample_recovered_tokens_kernel(
         return
 
     token_idx = start_idx + pos
+    use_no_draft_probs_recovery = False
+    if USE_TARGET_MAX_REQUEST_MASK_FOR_NO_DRAFT_PROBS:
+        use_no_draft_probs_recovery = tl.load(target_max_request_mask_ptr + req_idx)
 
     if ENABLE_REDUCE_SAMPLING:
         C = vocab_size
@@ -359,7 +460,7 @@ def sample_recovered_tokens_kernel(
 
             gidx = tl.load(target_indices_ptr + token_idx * C + offs, mask=mask, other=0).to(tl.int64)
 
-            if NO_DRAFT_PROBS:
+            if NO_DRAFT_PROBS or use_no_draft_probs_recovery:
                 is_draft = (gidx == draft_token_id) & mask
                 prob = tl.where(is_draft, 0.0, tprob)
             else:
@@ -389,7 +490,7 @@ def sample_recovered_tokens_kernel(
         loop = (vocab_size + SUB_BLOCK - 1) // SUB_BLOCK
         global_recovered_id = -1
         global_max_p = -1.0
-        if NO_DRAFT_PROBS:
+        if NO_DRAFT_PROBS or use_no_draft_probs_recovery:
             draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
             for loop_i in range(loop):
                 vocab_start = loop_i * SUB_BLOCK
@@ -397,8 +498,8 @@ def sample_recovered_tokens_kernel(
                 prob = tl.load(
                     target_probs_ptr + (start_idx + pos) * vocab_size + vocab_offset,
                     mask=vocab_offset < vocab_size,
-                    other=0,
-                )
+                    other=0.0,
+                ).to(tl.float32)
                 prob = tl.where(vocab_offset == draft_token_id, 0.0, prob)
                 q = tl.load(
                     q_ptr + req_idx * vocab_size + vocab_offset, mask=vocab_offset < vocab_size, other=float("-inf")
@@ -416,14 +517,14 @@ def sample_recovered_tokens_kernel(
                 draft_prob = tl.load(
                     draft_probs_ptr + (start_idx + pos) * vocab_size + vocab_offset,
                     mask=vocab_offset < vocab_size,
-                    other=0,
-                )
+                    other=0.0,
+                ).to(tl.float32)
                 target_prob = tl.load(
                     target_probs_ptr + (start_idx + pos) * vocab_size + vocab_offset,
                     mask=vocab_offset < vocab_size,
-                    other=0,
-                )
-                prob = tl.maximum(target_prob - draft_prob, 0)
+                    other=0.0,
+                ).to(tl.float32)
+                prob = tl.maximum(target_prob - draft_prob, 0.0)
                 # NOTE(woosuk): We don't need `prob = prob / tl.sum(prob)` here because
                 # `tl.argmax` will select the maximum value.
 
@@ -501,6 +602,8 @@ def rejection_random_sample_block_verify_kernel(
     draft_probs_ptr,  # [num_tokens, vocab_size] or None
     target_probs_ptr,  # [num_tokens, vocab_size] or [num_tokens, selected_vocab_size] if ENABLE_REDUCE_SAMPLING
     target_indices_ptr,  # [num_tokens, selected_vocab_size] global vocab indices, only used if ENABLE_REDUCE_SAMPLING
+    target_max_probs_ptr,  # [num_tokens]
+    target_max_request_mask_ptr,  # [batch_size]
     bonus_token_ids_ptr,  # [batch_size]
     recovered_token_ids_ptr,  # [num_tokens]
     uniform_probs_ptr,  # [num_tokens]
@@ -510,11 +613,17 @@ def rejection_random_sample_block_verify_kernel(
     global_vocab_size,  # global vocab size for draft_probs indexing (only used if ENABLE_REDUCE_SAMPLING)
     vec_len,
     ori_target_probs_ptr,  # [num_tokens, ori_vocab_size] original probs for entropy
+    NO_DRAFT_PROBS_TARGET_PROB_THRESHOLD,
+    NO_DRAFT_PROBS_ACCEPTANCE_BETA,
+    EAGLE3_ACCEPTANCE_ALPHA,
     NO_ORI_TARGET_PROBS: tl.constexpr,
     NO_DRAFT_PROBS: tl.constexpr,
     ENABLE_REDUCE_SAMPLING: tl.constexpr,  # Whether using reduce_sampling
-    BLOCK_SIZE: tl.constexpr,
+    USE_TARGET_MAX_FOR_NO_DRAFT_PROBS: tl.constexpr,
+    USE_TARGET_MAX_REQUEST_MASK_FOR_NO_DRAFT_PROBS: tl.constexpr,
+    ADJUST_EAGLE3_ACCEPTANCE: tl.constexpr,
     ENTROPY_VERIFY: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
     VOCAB_BLOCK_SIZE: tl.constexpr = 512,
     POSTERIOR_THRESHOLD: tl.constexpr = 0.95,
     POSTERIOR_ALPHA: tl.constexpr = 0.4,
@@ -532,160 +641,148 @@ def rejection_random_sample_block_verify_kernel(
     end_idxs = tl.load(cu_num_draft_tokens_ptr + offsets, not_greedy_mask)
     n_num_draft_tokens = end_idxs - start_idxs
 
-    if ENABLE_REDUCE_SAMPLING:
-        for req_i in range(BLOCK_SIZE):
-            not_greedy = get_element(not_greedy_mask, (req_i,))
-            if not_greedy:
-                pi = 1.0
-                uniform_prob = 1.0
-                last_accepted_token_pos = -1
-                start_idx = get_element(start_idxs, (req_i,))
-                req_idx = block_idx * BLOCK_SIZE + req_i
-                num_draft_tokens = get_element(n_num_draft_tokens, (req_i,))
+    for req_i in range(BLOCK_SIZE):
+        not_greedy = get_element(not_greedy_mask, (req_i,))
+        if not_greedy:
+            rejected = False
+            pi = 1.0
+            uniform_prob = 1.0
+            last_accepted_token_pos = -1
+            start_idx = get_element(start_idxs, (req_i,))
+            req_idx = block_idx * BLOCK_SIZE + req_i
+            num_draft_tokens = get_element(n_num_draft_tokens, (req_i,))
+            use_target_max_for_req = USE_TARGET_MAX_FOR_NO_DRAFT_PROBS
+            if USE_TARGET_MAX_REQUEST_MASK_FOR_NO_DRAFT_PROBS:
+                use_target_max_for_req = tl.load(target_max_request_mask_ptr + req_idx)
 
-                for pos in range(num_draft_tokens):
+            for pos in range(num_draft_tokens):
+                if not rejected:
                     token_idx = start_idx + pos
                     draft_token_id = tl.load(draft_token_ids_ptr + token_idx)
 
-                    if draft_token_id == -1:
-                        pi = 0.0
+                    if draft_token_id < 0:
+                        rejected = True
                     else:
                         target_prob = 0.0
-                        found = False
-
-                        for v_offset in range(0, vocab_size, VOCAB_BLOCK_SIZE):
-                            if not found:
-                                vocab_offsets = v_offset + tl.arange(0, VOCAB_BLOCK_SIZE)
-                                vocab_mask = vocab_offsets < vocab_size
-
-                                candidate_indices = tl.load(
-                                    target_indices_ptr + token_idx * vocab_size + vocab_offsets,
-                                    mask=vocab_mask,
-                                    other=-1,
-                                )
-
-                                match_mask = candidate_indices == draft_token_id
-
-                                candidate_probs = tl.load(
-                                    target_probs_ptr + token_idx * vocab_size + vocab_offsets,
-                                    mask=vocab_mask,
-                                    other=0.0,
-                                )
-
-                                current_match_prob = tl.sum(candidate_probs * match_mask, axis=0)
-
-                                if current_match_prob > 0.0:
-                                    target_prob = current_match_prob
-                                    found = True
+                        if ENABLE_REDUCE_SAMPLING:
+                            found = False
+                            for v_offset in range(0, vocab_size, VOCAB_BLOCK_SIZE):
+                                if not found:
+                                    vocab_offsets = v_offset + tl.arange(0, VOCAB_BLOCK_SIZE)
+                                    vocab_mask = vocab_offsets < vocab_size
+                                    candidate_indices = tl.load(
+                                        target_indices_ptr + token_idx * vocab_size + vocab_offsets,
+                                        mask=vocab_mask,
+                                        other=-1,
+                                    )
+                                    match_mask = candidate_indices == draft_token_id
+                                    candidate_probs = tl.load(
+                                        target_probs_ptr + token_idx * vocab_size + vocab_offsets,
+                                        mask=vocab_mask,
+                                        other=0.0,
+                                    )
+                                    current_match_prob = tl.sum(candidate_probs * match_mask, axis=0)
+                                    if current_match_prob > 0.0:
+                                        target_prob = current_match_prob
+                                        found = True
+                        else:
+                            target_prob = tl.load(
+                                target_probs_ptr + token_idx * vocab_size + draft_token_id
+                            ).to(tl.float32)
 
                         tmp_uniform_prob = tl.load(uniform_probs_ptr + token_idx)
-                        uniform_prob = uniform_prob * tmp_uniform_prob
+                        if ADJUST_EAGLE3_ACCEPTANCE:
+                            tmp_uniform_prob = tl.where(
+                                use_target_max_for_req,
+                                tmp_uniform_prob,
+                                tmp_uniform_prob / EAGLE3_ACCEPTANCE_ALPHA,
+                            )
 
-                        if NO_DRAFT_PROBS:
-                            draft_prob = 1.0
-                        else:
-                            draft_prob = tl.load(draft_probs_ptr + token_idx * global_vocab_size + draft_token_id)
-
-                        pi = min(pi * target_prob / draft_prob, 1.0)
-                        if draft_prob > 0 and pi >= uniform_prob:
-                            last_accepted_token_pos = pos
-
-                # Store accepted tokens
-                if last_accepted_token_pos > -1:
-                    for pos in range(last_accepted_token_pos + 1):
-                        token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
-                        tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos, token_id)
-
-                # Store recovered or bonus token
-                if last_accepted_token_pos + 1 < num_draft_tokens:
-                    # Rejected - store recovered token
-                    recovered_token_id = tl.load(recovered_token_ids_ptr + start_idx + last_accepted_token_pos + 1)
-                    tl.store(
-                        output_token_ids_ptr + req_idx * (max_spec_len + 1) + last_accepted_token_pos + 1,
-                        recovered_token_id,
-                    )
-                else:
-                    # All accepted - store bonus token
-                    bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
-                    tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_draft_tokens, bonus_token_id)
-    else:
-        for req_i in range(BLOCK_SIZE):
-            not_greedy = get_element(not_greedy_mask, (req_i,))
-            if not_greedy:
-                pi = 1.0
-                uniform_prob = 1.0
-                last_accepted_token_pos = -1
-                start_idx = get_element(start_idxs, (req_i,))
-                req_idx = block_idx * BLOCK_SIZE + req_i
-                num_draft_tokens = get_element(n_num_draft_tokens, (req_i,))
-
-                for pos in range(num_draft_tokens):
-                    token_idx = start_idx + pos
-                    draft_token_id = tl.load(draft_token_ids_ptr + token_idx)
-
-                    if draft_token_id == -1:
-                        pi = 0.0
-                    else:
-                        target_prob = tl.load(target_probs_ptr + token_idx * vocab_size + draft_token_id)
-
-                        tmp_uniform_prob = tl.load(uniform_probs_ptr + token_idx)
-                        uniform_prob = uniform_prob * tmp_uniform_prob
-
-                        if NO_DRAFT_PROBS:
-                            draft_prob = 1.0
-                        else:
-                            vocab_for_draft = global_vocab_size if ENABLE_REDUCE_SAMPLING else vocab_size
-                            draft_prob = tl.load(draft_probs_ptr + token_idx * vocab_for_draft + draft_token_id)
-
-                        if ENTROPY_VERIFY:
+                        if ENTROPY_VERIFY and not use_target_max_for_req:
                             loop = (vocab_size + SUB_BLOCK - 1) // SUB_BLOCK
                             entropy = 0.0
                             for loop_i in range(loop):
                                 vocab_start = loop_i * SUB_BLOCK
                                 vocab_offset = vocab_start + tl.arange(0, SUB_BLOCK)
                                 vocab_mask = vocab_offset < vocab_size
-                                if NO_ORI_TARGET_PROBS:
+                                if ENABLE_REDUCE_SAMPLING or NO_ORI_TARGET_PROBS:
                                     probs = tl.load(
                                         target_probs_ptr + token_idx * vocab_size + vocab_offset,
                                         vocab_mask,
-                                        other=0,
-                                    )
+                                        other=0.0,
+                                    ).to(tl.float32)
                                 else:
                                     probs = tl.load(
                                         ori_target_probs_ptr + token_idx * vocab_size + vocab_offset,
                                         vocab_mask,
-                                        other=0,
-                                    )
+                                        other=0.0,
+                                    ).to(tl.float32)
                                 log_probs = tl.log(probs + EPSILON)
                                 entropy_contrib = -probs * log_probs
                                 entropy += tl.sum(entropy_contrib)
 
-                            exp_neg_entropy = tl.exp(-entropy * POSTERIOR_ALPHA)
-                            threshold_by_entropy = exp_neg_entropy
-                            threshold = tl.minimum(threshold_by_entropy, POSTERIOR_THRESHOLD)
-                            _uniform_prob = threshold * uniform_prob
+                            tmp_uniform_prob = tmp_uniform_prob * tl.minimum(
+                                tl.exp(-entropy * POSTERIOR_ALPHA),
+                                POSTERIOR_THRESHOLD,
+                            )
+                        uniform_prob = uniform_prob * tmp_uniform_prob
+
+                        if use_target_max_for_req:
+                            draft_prob = tl.load(target_max_probs_ptr + token_idx).to(tl.float32)
+                        elif NO_DRAFT_PROBS:
+                            draft_prob = 1.0
                         else:
-                            _uniform_prob = uniform_prob
+                            vocab_for_draft = global_vocab_size if ENABLE_REDUCE_SAMPLING else vocab_size
+                            draft_prob = tl.load(
+                                draft_probs_ptr
+                                + token_idx * vocab_for_draft
+                                + draft_token_id
+                            ).to(tl.float32)
 
-                        pi = min(pi * target_prob / draft_prob, 1.0)
-                        if draft_prob > 0 and pi >= _uniform_prob:
-                            last_accepted_token_pos = pos
+                        if draft_prob > 0:
+                            acceptance_score = target_prob / draft_prob
+                            if use_target_max_for_req:
+                                acceptance_score = (
+                                    acceptance_score
+                                    * NO_DRAFT_PROBS_ACCEPTANCE_BETA
+                                )
+                            pi = min(pi * acceptance_score, 1.0)
+                            if pi >= uniform_prob:
+                                if use_target_max_for_req:
+                                    if target_prob >= NO_DRAFT_PROBS_TARGET_PROB_THRESHOLD:
+                                        last_accepted_token_pos = pos
+                                        rejected = False
+                                    else:
+                                        rejected = True
+                                else:
+                                    last_accepted_token_pos = pos
+                                    rejected = False
+                            else:
+                                rejected = True
+                        else:
+                            rejected = True
 
-                # Store accepted tokens
-                if last_accepted_token_pos > -1:
-                    for pos in range(last_accepted_token_pos + 1):
-                        token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
-                        tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos, token_id)
+            if last_accepted_token_pos > -1:
+                for pos in range(last_accepted_token_pos + 1):
+                    token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
+                    tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos, token_id)
 
-                # Store recovered or bonus token
-                if last_accepted_token_pos + 1 < num_draft_tokens:
-                    # Rejected - store recovered token
-                    recovered_token_id = tl.load(recovered_token_ids_ptr + start_idx + last_accepted_token_pos + 1)
-                    tl.store(
-                        output_token_ids_ptr + req_idx * (max_spec_len + 1) + last_accepted_token_pos + 1,
-                        recovered_token_id,
-                    )
-                else:
-                    # All accepted - store bonus token
-                    bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
-                    tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_draft_tokens, bonus_token_id)
+            if rejected:
+                recovered_token_id = tl.load(
+                    recovered_token_ids_ptr + start_idx + last_accepted_token_pos + 1
+                )
+                tl.store(
+                    output_token_ids_ptr
+                    + req_idx * (max_spec_len + 1)
+                    + last_accepted_token_pos
+                    + 1,
+                    recovered_token_id,
+                )
+            else:
+                bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
+                tl.store(
+                    output_token_ids_ptr
+                    + req_idx * (max_spec_len + 1)
+                    + num_draft_tokens,
+                    bonus_token_id,
+                )
