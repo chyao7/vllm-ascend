@@ -3766,3 +3766,10 @@ def get_prefill_pp_indices(
         start_layer = sum(partitions[:pp_rank])
         end_layer = start_layer + partitions[pp_rank]
         return (start_layer, end_layer)
+
+
+from vllm_ascend.patch_cmss.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # noqa: E402
+    apply as apply_cmss_mooncake_v1_patch,
+)
+
+apply_cmss_mooncake_v1_patch()
