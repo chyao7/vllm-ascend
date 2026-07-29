@@ -22,7 +22,7 @@ import math
 import sys
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
@@ -102,7 +102,14 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_config import (
+    EAGLE_ACCEPTANCE_FALLBACK_MODE_DRAFT_PROBS,
+    EAGLE_ACCEPTANCE_MODE_DRAFT_PROBS,
+    EAGLE_ACCEPTANCE_MODE_TARGET_MAX_FIRST_DRAFT_ROUNDS,
+    EAGLE_ACCEPTANCE_MODE_TARGET_MAX_INTERVAL_DRAFT_ROUNDS,
+    EAGLE_ACCEPTANCE_MODE_TARGET_MAX_PERIODIC,
+    get_ascend_config,
+)
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
@@ -184,7 +191,11 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
 
 from vllm.model_executor.models.interfaces import supports_multimodal_pruning
 
-from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
+from vllm_ascend.sample.rejection_sampler import (
+    AscendRejectionSampler,
+    reset_target_max_request_mask_context,
+    set_target_max_request_mask_context,
+)
 
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
@@ -341,6 +352,9 @@ class NPUModelRunner(GPUModelRunner):
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        self._eagle_draft_round_counts: dict[str, int] = {}
+        self._eagle_target_max_draft_round_by_req: dict[str, bool] = {}
+        self._eagle_draft_probs_by_req: dict[str, torch.Tensor] = {}
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
@@ -1290,6 +1304,15 @@ class NPUModelRunner(GPUModelRunner):
                 cu_num_tokens,
                 num_pcp_pads=self.pcp_manager.num_pcp_pads_cpu[:num_reqs] if self.pcp_size > 1 else None,
             )
+            eagle_draft_probs = self._get_eagle_draft_probs_for_scheduled_tokens(
+                scheduler_output.scheduled_spec_decode_tokens
+            )
+            if eagle_draft_probs is not None:
+                setattr(spec_decode_metadata, "draft_probs", eagle_draft_probs)
+            self._attach_target_max_draft_round_mask(
+                spec_decode_metadata,
+                scheduler_output.scheduled_spec_decode_tokens,
+            )
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
 
@@ -1563,6 +1586,233 @@ class NPUModelRunner(GPUModelRunner):
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
         )
+
+    def _use_target_max_draft_round_mask(self) -> bool:
+        speculative_config = self.vllm_config.speculative_config
+        return (
+            speculative_config is not None
+            and speculative_config.method in ("eagle", "eagle3", "mtp")
+            and self.ascend_config.eagle_acceptance_mode
+            in (
+                EAGLE_ACCEPTANCE_MODE_TARGET_MAX_FIRST_DRAFT_ROUNDS,
+                EAGLE_ACCEPTANCE_MODE_TARGET_MAX_INTERVAL_DRAFT_ROUNDS,
+                EAGLE_ACCEPTANCE_MODE_TARGET_MAX_PERIODIC,
+            )
+        )
+
+    def _use_eagle_draft_probs_acceptance(self) -> bool:
+        speculative_config = self.vllm_config.speculative_config
+        if speculative_config is None or speculative_config.method not in (
+            "eagle",
+            "eagle3",
+        ):
+            return False
+        if (
+            self.ascend_config.eagle_acceptance_mode
+            == EAGLE_ACCEPTANCE_MODE_DRAFT_PROBS
+        ):
+            return True
+        if (
+            self.ascend_config.eagle_acceptance_mode
+            == EAGLE_ACCEPTANCE_MODE_TARGET_MAX_FIRST_DRAFT_ROUNDS
+            and self.ascend_config.eagle_acceptance_fallback_mode
+            == EAGLE_ACCEPTANCE_FALLBACK_MODE_DRAFT_PROBS
+        ):
+            return True
+        if (
+            self.ascend_config.eagle_acceptance_mode
+            == EAGLE_ACCEPTANCE_MODE_TARGET_MAX_PERIODIC
+            and self.ascend_config.eagle_acceptance_secondary_mode
+            == EAGLE_ACCEPTANCE_MODE_DRAFT_PROBS
+        ):
+            return True
+        return False
+
+    def _use_target_max_for_draft_round(self, draft_round: int) -> bool:
+        if (
+            self.ascend_config.eagle_acceptance_mode
+            == EAGLE_ACCEPTANCE_MODE_TARGET_MAX_PERIODIC
+        ):
+            target_max_steps = (
+                self.ascend_config.eagle_acceptance_target_max_period_steps
+            )
+            secondary_steps = (
+                self.ascend_config.eagle_acceptance_secondary_period_steps
+            )
+            period = target_max_steps + secondary_steps
+            return (draft_round - 1) % period < target_max_steps
+
+        max_target_rounds = (
+            self.ascend_config.eagle_acceptance_target_max_draft_rounds
+        )
+        if draft_round > max_target_rounds:
+            return False
+
+        if (
+            self.ascend_config.eagle_acceptance_mode
+            == EAGLE_ACCEPTANCE_MODE_TARGET_MAX_INTERVAL_DRAFT_ROUNDS
+        ):
+            interval = self.ascend_config.eagle_acceptance_target_max_draft_interval
+            return (draft_round - 1) % interval == 0
+
+        return True
+
+    def _prune_eagle_draft_round_state(self) -> None:
+        active_req_ids = set(self.requests)
+        req_ids_with_state = (
+            set(self._eagle_draft_round_counts)
+            | set(self._eagle_target_max_draft_round_by_req)
+            | set(self._eagle_draft_probs_by_req)
+        )
+        for req_id in req_ids_with_state:
+            if req_id not in active_req_ids:
+                self._clear_eagle_draft_round_state((req_id,))
+
+    def _clear_eagle_draft_round_state(self, req_ids: Iterable[str]) -> None:
+        for req_id in req_ids:
+            self._eagle_draft_round_counts.pop(req_id, None)
+            self._eagle_target_max_draft_round_by_req.pop(req_id, None)
+            self._eagle_draft_probs_by_req.pop(req_id, None)
+
+    def _discarded_req_indices(self) -> set[int]:
+        return set(
+            map(
+                int,
+                self.discard_request_indices.np[
+                    : self.num_discarded_requests
+                ].tolist(),
+            )
+        )
+
+    def _record_eagle_draft_rounds(
+        self,
+        draft_token_ids: torch.Tensor | list[list[int]] | None,
+    ) -> None:
+        if not self._use_target_max_draft_round_mask() or draft_token_ids is None:
+            return
+        req_ids = self.input_batch.req_ids
+        discarded_req_indices = self._discarded_req_indices()
+        if torch.is_tensor(draft_token_ids):
+            num_reqs = min(draft_token_ids.shape[0], len(req_ids))
+            predicted_req_ids = [
+                req_id
+                for req_idx, req_id in enumerate(req_ids[:num_reqs])
+                if req_idx not in discarded_req_indices
+            ]
+        else:
+            predicted_req_ids = [
+                req_id
+                for req_idx, (req_id, token_ids) in enumerate(
+                    zip(req_ids, draft_token_ids)
+                )
+                if req_idx not in discarded_req_indices and len(token_ids) > 0
+            ]
+
+        for req_id in predicted_req_ids:
+            draft_round = self._eagle_draft_round_counts.get(req_id, 0) + 1
+            self._eagle_draft_round_counts[req_id] = draft_round
+            self._eagle_target_max_draft_round_by_req[req_id] = (
+                self._use_target_max_for_draft_round(draft_round)
+            )
+        self._prune_eagle_draft_round_state()
+
+    def _record_eagle_draft_probs(
+        self,
+        draft_token_ids: torch.Tensor | list[list[int]] | None,
+    ) -> None:
+        if not self._use_eagle_draft_probs_acceptance() or draft_token_ids is None:
+            return
+        draft_probs = getattr(self.drafter, "last_draft_probs", None)
+        if draft_probs is None:
+            raise RuntimeError(
+                "eagle_acceptance_mode=draft_probs requires the EAGLE drafter "
+                "to produce draft probabilities, but no probabilities were "
+                "recorded."
+            )
+        if not torch.is_tensor(draft_token_ids) or not torch.is_tensor(draft_probs):
+            raise RuntimeError(
+                "eagle_acceptance_mode=draft_probs requires tensor draft "
+                "tokens and tensor draft probabilities."
+            )
+        if draft_probs.ndim != 3:
+            raise RuntimeError(
+                "eagle_acceptance_mode=draft_probs expects draft_probs with "
+                "shape [batch_size, num_speculative_tokens, vocab_size], but "
+                f"got shape {tuple(draft_probs.shape)}."
+            )
+
+        req_ids = self.input_batch.req_ids
+        discarded_req_indices = self._discarded_req_indices()
+        num_reqs = min(draft_token_ids.shape[0], draft_probs.shape[0], len(req_ids))
+        for req_idx, req_id in enumerate(req_ids[:num_reqs]):
+            if req_idx in discarded_req_indices:
+                self._eagle_draft_probs_by_req.pop(req_id, None)
+                continue
+            self._eagle_draft_probs_by_req[req_id] = draft_probs[req_idx].detach()
+        self._prune_eagle_draft_round_state()
+
+    def _get_eagle_draft_probs_for_scheduled_tokens(
+        self,
+        scheduled_spec_decode_tokens: dict[str, list[int]],
+    ) -> torch.Tensor | None:
+        if not self._use_eagle_draft_probs_acceptance():
+            return None
+
+        draft_probs_by_req = []
+        for req_id in self.input_batch.req_ids:
+            num_draft_tokens = len(scheduled_spec_decode_tokens.get(req_id, []))
+            if num_draft_tokens == 0:
+                continue
+            draft_probs = self._eagle_draft_probs_by_req.get(req_id)
+            if draft_probs is None:
+                raise RuntimeError(
+                    "Missing draft probabilities for request "
+                    f"{req_id} while eagle_acceptance_mode=draft_probs."
+                )
+            if draft_probs.shape[0] < num_draft_tokens:
+                raise RuntimeError(
+                    "Insufficient draft probabilities for request "
+                    f"{req_id}: need {num_draft_tokens}, got "
+                    f"{draft_probs.shape[0]}."
+                )
+            draft_probs_by_req.append(draft_probs[:num_draft_tokens])
+
+        for req_id in scheduled_spec_decode_tokens:
+            self._eagle_draft_probs_by_req.pop(req_id, None)
+        self._prune_eagle_draft_round_state()
+
+        if not draft_probs_by_req:
+            return None
+        return torch.cat(draft_probs_by_req, dim=0).contiguous()
+
+    def _attach_target_max_draft_round_mask(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata,
+        scheduled_spec_decode_tokens: dict[str, list[int]],
+    ) -> None:
+        if not self._use_target_max_draft_round_mask():
+            return
+
+        target_max_request_mask = [
+            bool(
+                scheduled_spec_decode_tokens.get(req_id)
+                and self._eagle_target_max_draft_round_by_req.get(req_id, False)
+            )
+            for req_id in self.input_batch.req_ids
+        ]
+        target_max_request_mask_tensor = torch.tensor(
+            target_max_request_mask,
+            dtype=torch.bool,
+            pin_memory=self.pin_memory,
+        ).to(self.device, non_blocking=True)
+        setattr(
+            spec_decode_metadata,
+            "target_max_no_draft_probs_request_mask",
+            target_max_request_mask_tensor,
+        )
+        for req_id in scheduled_spec_decode_tokens:
+            self._eagle_target_max_draft_round_by_req.pop(req_id, None)
+        self._prune_eagle_draft_round_state()
 
     def _correct_optimistic_seq_lens_cpu(self, num_reqs: int) -> None:
         """Correct ``optimistic_seq_lens_cpu`` for async spec-decode drift.
@@ -2435,6 +2685,8 @@ class NPUModelRunner(GPUModelRunner):
                 sample_hidden_states,
                 batch_desc,
             )
+            self._record_eagle_draft_rounds(self._draft_token_ids)
+            self._record_eagle_draft_probs(self._draft_token_ids)
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         (
@@ -2587,12 +2839,24 @@ class NPUModelRunner(GPUModelRunner):
         if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
             max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
             self.rejection_sampler.prepare_sampling(max_topk)
-        sampler_output = self.rejection_sampler(
+        target_max_request_mask = getattr(
             spec_decode_metadata,
-            None,  # draft_probs
-            logits,
-            sampling_metadata,
+            "target_max_no_draft_probs_request_mask",
+            None,
         )
+        draft_probs = getattr(spec_decode_metadata, "draft_probs", None)
+        context_token = set_target_max_request_mask_context(
+            target_max_request_mask
+        )
+        try:
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                draft_probs,
+                logits,
+                sampling_metadata,
+            )
+        finally:
+            reset_target_max_request_mask_context(context_token)
         return sampler_output
 
     # TODO: remove this func after eagle_proposer is refactored and

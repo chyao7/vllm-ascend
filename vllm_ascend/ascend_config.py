@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import math
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +23,54 @@ from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+EAGLE_ACCEPTANCE_MODE_LEGACY = "legacy"
+EAGLE_ACCEPTANCE_MODE_TARGET_MAX = "target_max"
+EAGLE_ACCEPTANCE_MODE_TARGET_MAX_FIRST_DRAFT_ROUNDS = (
+    "target_max_first_draft_rounds"
+)
+EAGLE_ACCEPTANCE_MODE_TARGET_MAX_INTERVAL_DRAFT_ROUNDS = (
+    "target_max_interval_draft_rounds"
+)
+EAGLE_ACCEPTANCE_MODE_DRAFT_PROBS = "draft_probs"
+EAGLE_ACCEPTANCE_MODE_ALPHA = "alpha"
+EAGLE_ACCEPTANCE_MODE_ENTROPY_VERIFIED = "entropy_verified"
+EAGLE_ACCEPTANCE_MODE_TARGET_MAX_PERIODIC = "target_max_periodic"
+EAGLE_ACCEPTANCE_SECONDARY_MODES = {
+    EAGLE_ACCEPTANCE_MODE_ALPHA,
+    EAGLE_ACCEPTANCE_MODE_DRAFT_PROBS,
+    EAGLE_ACCEPTANCE_MODE_ENTROPY_VERIFIED,
+}
+EAGLE_ACCEPTANCE_ALPHA_DEFAULT = 1.0
+EAGLE_ACCEPTANCE_BETA_DEFAULT = 0.8
+EAGLE_ACCEPTANCE_TARGET_PROB_THRESHOLD_DEFAULT = 0.1
+EAGLE_ACCEPTANCE_TARGET_MAX_DRAFT_ROUNDS_DEFAULT = 0
+EAGLE_ACCEPTANCE_TARGET_MAX_DRAFT_INTERVAL_DEFAULT = 1
+EAGLE_ACCEPTANCE_TARGET_MAX_PERIOD_STEPS_DEFAULT = 1
+EAGLE_ACCEPTANCE_SECONDARY_PERIOD_STEPS_DEFAULT = 1
+EAGLE_ACCEPTANCE_SECONDARY_MODE_DEFAULT = EAGLE_ACCEPTANCE_MODE_ALPHA
+EAGLE_ACCEPTANCE_POSTERIOR_THRESHOLD_DEFAULT = 0.95
+EAGLE_ACCEPTANCE_POSTERIOR_ALPHA_DEFAULT = 0.4
+EAGLE_ACCEPTANCE_FALLBACK_MODE_LEGACY = "legacy"
+EAGLE_ACCEPTANCE_FALLBACK_MODE_ALPHA = "alpha"
+EAGLE_ACCEPTANCE_FALLBACK_MODE_DRAFT_PROBS = "draft_probs"
+EAGLE_ACCEPTANCE_FALLBACK_MODE_ENTROPY_VERIFIED = "entropy_verified"
+_VALID_EAGLE_ACCEPTANCE_MODES = {
+    EAGLE_ACCEPTANCE_MODE_LEGACY,
+    EAGLE_ACCEPTANCE_MODE_TARGET_MAX,
+    EAGLE_ACCEPTANCE_MODE_TARGET_MAX_FIRST_DRAFT_ROUNDS,
+    EAGLE_ACCEPTANCE_MODE_TARGET_MAX_INTERVAL_DRAFT_ROUNDS,
+    EAGLE_ACCEPTANCE_MODE_DRAFT_PROBS,
+    EAGLE_ACCEPTANCE_MODE_ALPHA,
+    EAGLE_ACCEPTANCE_MODE_ENTROPY_VERIFIED,
+    EAGLE_ACCEPTANCE_MODE_TARGET_MAX_PERIODIC,
+}
+_VALID_EAGLE_FALLBACK_MODES = {
+    EAGLE_ACCEPTANCE_FALLBACK_MODE_LEGACY,
+    EAGLE_ACCEPTANCE_FALLBACK_MODE_ALPHA,
+    EAGLE_ACCEPTANCE_FALLBACK_MODE_DRAFT_PROBS,
+    EAGLE_ACCEPTANCE_FALLBACK_MODE_ENTROPY_VERIFIED,
+}
 
 
 class AscendConfig:
@@ -160,6 +209,9 @@ class AscendConfig:
                 "only guaranteed when the recompute scheduler is enabled."
             )
         self.enable_cpu_binding = additional_config.get("enable_cpu_binding", True)
+        self.disable_spec_decode_block_verify = bool(
+            additional_config.get("disable_spec_decode_block_verify", False)
+        )
         self.enable_sleep_mode_extra_cleanup = additional_config.get("enable_sleep_mode_extra_cleanup", False)
         self.multistream_dsv4_dsa_overlap = additional_config.get("multistream_dsv4_dsa_overlap", True)
         self.enable_prefill_mc2 = bool(additional_config.get("enable_prefill_mc2", False))
@@ -330,6 +382,430 @@ class AscendConfig:
         # Enable Block Verify and Entropy Verify in Rejection Sampler
         rejection_sampler_config = additional_config.get("rejection_sampler_config", {})
         self.rejection_sampler_config = RejectionSamplerConfig(rejection_sampler_config)
+        self._init_eagle_acceptance_config(
+            additional_config, rejection_sampler_config, vllm_config
+        )
+
+    def _init_eagle_acceptance_config(
+        self,
+        additional_config: dict[str, Any],
+        rejection_sampler_config: dict[str, Any],
+        vllm_config: "VllmConfig",
+    ) -> None:
+        default_eagle_acceptance_mode = (
+            EAGLE_ACCEPTANCE_MODE_ENTROPY_VERIFIED
+            if rejection_sampler_config.get("enable_entropy_verify", False)
+            else EAGLE_ACCEPTANCE_MODE_LEGACY
+        )
+        self.eagle_acceptance_mode = additional_config.get(
+            "eagle_acceptance_mode",
+            default_eagle_acceptance_mode,
+        )
+        if self.eagle_acceptance_mode not in _VALID_EAGLE_ACCEPTANCE_MODES:
+            valid_modes = ", ".join(sorted(_VALID_EAGLE_ACCEPTANCE_MODES))
+            raise ValueError(
+                f"Unsupported eagle_acceptance_mode: "
+                f"{self.eagle_acceptance_mode}. Valid modes: {valid_modes}"
+            )
+
+        self.eagle_acceptance_secondary_mode = additional_config.get(
+            "eagle_acceptance_secondary_mode",
+            EAGLE_ACCEPTANCE_SECONDARY_MODE_DEFAULT,
+        )
+        if self.eagle_acceptance_secondary_mode not in EAGLE_ACCEPTANCE_SECONDARY_MODES:
+            valid_secondary_modes = ", ".join(
+                sorted(EAGLE_ACCEPTANCE_SECONDARY_MODES)
+            )
+            raise ValueError(
+                "Unsupported eagle_acceptance_secondary_mode: "
+                f"{self.eagle_acceptance_secondary_mode}. Valid modes: "
+                f"{valid_secondary_modes}"
+            )
+
+        self.eagle_acceptance_beta = float(
+            additional_config.get(
+                "eagle_acceptance_beta",
+                EAGLE_ACCEPTANCE_BETA_DEFAULT,
+            )
+        )
+        if (
+            not math.isfinite(self.eagle_acceptance_beta)
+            or self.eagle_acceptance_beta < 0
+        ):
+            raise ValueError(
+                "eagle_acceptance_beta must be a finite value greater than "
+                f"or equal to 0.0, but got {self.eagle_acceptance_beta}."
+            )
+
+        eagle_acceptance_target_prob_threshold = float(
+            additional_config.get(
+                "eagle_acceptance_target_prob_threshold",
+                EAGLE_ACCEPTANCE_TARGET_PROB_THRESHOLD_DEFAULT,
+            )
+        )
+        if not math.isfinite(eagle_acceptance_target_prob_threshold):
+            raise ValueError(
+                "eagle_acceptance_target_prob_threshold must be a finite "
+                f"value, but got {eagle_acceptance_target_prob_threshold}."
+            )
+        self.eagle_acceptance_target_prob_threshold = min(
+            max(eagle_acceptance_target_prob_threshold, 0.0),
+            1.0,
+        )
+
+        self.eagle_acceptance_alpha = float(
+            additional_config.get(
+                "eagle_acceptance_alpha",
+                EAGLE_ACCEPTANCE_ALPHA_DEFAULT,
+            )
+        )
+        if (
+            not math.isfinite(self.eagle_acceptance_alpha)
+            or self.eagle_acceptance_alpha <= 0
+        ):
+            raise ValueError(
+                "eagle_acceptance_alpha must be a finite value greater than "
+                f"0.0, but got {self.eagle_acceptance_alpha}."
+            )
+
+        self.eagle_acceptance_secondary_alpha = float(
+            additional_config.get(
+                "eagle_acceptance_secondary_alpha",
+                self.eagle_acceptance_alpha,
+            )
+        )
+        if (
+            not math.isfinite(self.eagle_acceptance_secondary_alpha)
+            or self.eagle_acceptance_secondary_alpha <= 0
+        ):
+            raise ValueError(
+                "eagle_acceptance_secondary_alpha must be a finite value "
+                "greater than 0.0, but got "
+                f"{self.eagle_acceptance_secondary_alpha}."
+            )
+
+        eagle_acceptance_posterior_threshold = float(
+            additional_config.get(
+                "eagle_acceptance_posterior_threshold",
+                rejection_sampler_config.get(
+                    "posterior_threshold",
+                    EAGLE_ACCEPTANCE_POSTERIOR_THRESHOLD_DEFAULT,
+                ),
+            )
+        )
+        if (
+            not math.isfinite(eagle_acceptance_posterior_threshold)
+            or not 0 < eagle_acceptance_posterior_threshold <= 1
+        ):
+            raise ValueError(
+                "eagle_acceptance_posterior_threshold must be a finite value "
+                "in (0.0, 1.0], but got "
+                f"{eagle_acceptance_posterior_threshold}."
+            )
+        self.eagle_acceptance_posterior_threshold = (
+            eagle_acceptance_posterior_threshold
+        )
+
+        eagle_acceptance_secondary_posterior_threshold = float(
+            additional_config.get(
+                "eagle_acceptance_secondary_posterior_threshold",
+                self.eagle_acceptance_posterior_threshold,
+            )
+        )
+        if (
+            not math.isfinite(eagle_acceptance_secondary_posterior_threshold)
+            or not 0 < eagle_acceptance_secondary_posterior_threshold <= 1
+        ):
+            raise ValueError(
+                "eagle_acceptance_secondary_posterior_threshold must be a "
+                "finite value in (0.0, 1.0], but got "
+                f"{eagle_acceptance_secondary_posterior_threshold}."
+            )
+        self.eagle_acceptance_secondary_posterior_threshold = (
+            eagle_acceptance_secondary_posterior_threshold
+        )
+
+        eagle_acceptance_posterior_alpha = float(
+            additional_config.get(
+                "eagle_acceptance_posterior_alpha",
+                rejection_sampler_config.get(
+                    "posterior_alpha",
+                    EAGLE_ACCEPTANCE_POSTERIOR_ALPHA_DEFAULT,
+                ),
+            )
+        )
+        if (
+            not math.isfinite(eagle_acceptance_posterior_alpha)
+            or eagle_acceptance_posterior_alpha < 0
+        ):
+            raise ValueError(
+                "eagle_acceptance_posterior_alpha must be a finite value "
+                "greater than or equal to 0.0, but got "
+                f"{eagle_acceptance_posterior_alpha}."
+            )
+        self.eagle_acceptance_posterior_alpha = (
+            eagle_acceptance_posterior_alpha
+        )
+
+        eagle_acceptance_secondary_posterior_alpha = float(
+            additional_config.get(
+                "eagle_acceptance_secondary_posterior_alpha",
+                self.eagle_acceptance_posterior_alpha,
+            )
+        )
+        if (
+            not math.isfinite(eagle_acceptance_secondary_posterior_alpha)
+            or eagle_acceptance_secondary_posterior_alpha < 0
+        ):
+            raise ValueError(
+                "eagle_acceptance_secondary_posterior_alpha must be a finite "
+                "value greater than or equal to 0.0, but got "
+                f"{eagle_acceptance_secondary_posterior_alpha}."
+            )
+        self.eagle_acceptance_secondary_posterior_alpha = (
+            eagle_acceptance_secondary_posterior_alpha
+        )
+
+        eagle_acceptance_target_max_draft_rounds = additional_config.get(
+            "eagle_acceptance_target_max_draft_rounds",
+            EAGLE_ACCEPTANCE_TARGET_MAX_DRAFT_ROUNDS_DEFAULT,
+        )
+        try:
+            if isinstance(eagle_acceptance_target_max_draft_rounds, bool):
+                raise ValueError
+            if isinstance(eagle_acceptance_target_max_draft_rounds, float) and (
+                not math.isfinite(eagle_acceptance_target_max_draft_rounds)
+                or not eagle_acceptance_target_max_draft_rounds.is_integer()
+            ):
+                raise ValueError
+            self.eagle_acceptance_target_max_draft_rounds = int(
+                eagle_acceptance_target_max_draft_rounds
+            )
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "eagle_acceptance_target_max_draft_rounds must be an integer "
+                "greater than or equal to 0, but got "
+                f"{eagle_acceptance_target_max_draft_rounds}."
+            ) from exc
+        if self.eagle_acceptance_target_max_draft_rounds < 0:
+            raise ValueError(
+                "eagle_acceptance_target_max_draft_rounds must be an integer "
+                "greater than or equal to 0, but got "
+                f"{self.eagle_acceptance_target_max_draft_rounds}."
+            )
+
+        eagle_acceptance_target_max_draft_interval = additional_config.get(
+            "eagle_acceptance_target_max_draft_interval",
+            EAGLE_ACCEPTANCE_TARGET_MAX_DRAFT_INTERVAL_DEFAULT,
+        )
+        try:
+            if isinstance(eagle_acceptance_target_max_draft_interval, bool):
+                raise ValueError
+            if isinstance(eagle_acceptance_target_max_draft_interval, float) and (
+                not math.isfinite(eagle_acceptance_target_max_draft_interval)
+                or not eagle_acceptance_target_max_draft_interval.is_integer()
+            ):
+                raise ValueError
+            self.eagle_acceptance_target_max_draft_interval = int(
+                eagle_acceptance_target_max_draft_interval
+            )
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "eagle_acceptance_target_max_draft_interval must be an integer "
+                "greater than or equal to 1, but got "
+                f"{eagle_acceptance_target_max_draft_interval}."
+            ) from exc
+        if self.eagle_acceptance_target_max_draft_interval < 1:
+            raise ValueError(
+                "eagle_acceptance_target_max_draft_interval must be an integer "
+                "greater than or equal to 1, but got "
+                f"{self.eagle_acceptance_target_max_draft_interval}."
+            )
+
+        eagle_acceptance_target_max_period_steps = additional_config.get(
+            "eagle_acceptance_target_max_period_steps",
+            EAGLE_ACCEPTANCE_TARGET_MAX_PERIOD_STEPS_DEFAULT,
+        )
+        try:
+            if isinstance(eagle_acceptance_target_max_period_steps, bool):
+                raise ValueError
+            if isinstance(eagle_acceptance_target_max_period_steps, float) and (
+                not math.isfinite(eagle_acceptance_target_max_period_steps)
+                or not eagle_acceptance_target_max_period_steps.is_integer()
+            ):
+                raise ValueError
+            self.eagle_acceptance_target_max_period_steps = int(
+                eagle_acceptance_target_max_period_steps
+            )
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "eagle_acceptance_target_max_period_steps must be an integer "
+                "greater than or equal to 1, but got "
+                f"{eagle_acceptance_target_max_period_steps}."
+            ) from exc
+        if self.eagle_acceptance_target_max_period_steps < 1:
+            raise ValueError(
+                "eagle_acceptance_target_max_period_steps must be an integer "
+                "greater than or equal to 1, but got "
+                f"{self.eagle_acceptance_target_max_period_steps}."
+            )
+
+        eagle_acceptance_secondary_period_steps = additional_config.get(
+            "eagle_acceptance_secondary_period_steps",
+            EAGLE_ACCEPTANCE_SECONDARY_PERIOD_STEPS_DEFAULT,
+        )
+        try:
+            if isinstance(eagle_acceptance_secondary_period_steps, bool):
+                raise ValueError
+            if isinstance(eagle_acceptance_secondary_period_steps, float) and (
+                not math.isfinite(eagle_acceptance_secondary_period_steps)
+                or not eagle_acceptance_secondary_period_steps.is_integer()
+            ):
+                raise ValueError
+            self.eagle_acceptance_secondary_period_steps = int(
+                eagle_acceptance_secondary_period_steps
+            )
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "eagle_acceptance_secondary_period_steps must be an integer "
+                "greater than or equal to 1, but got "
+                f"{eagle_acceptance_secondary_period_steps}."
+            ) from exc
+        if self.eagle_acceptance_secondary_period_steps < 1:
+            raise ValueError(
+                "eagle_acceptance_secondary_period_steps must be an integer "
+                "greater than or equal to 1, but got "
+                f"{self.eagle_acceptance_secondary_period_steps}."
+            )
+
+        if (
+            self.eagle_acceptance_mode
+            == EAGLE_ACCEPTANCE_MODE_TARGET_MAX_FIRST_DRAFT_ROUNDS
+            and self.eagle_acceptance_target_max_draft_rounds < 1
+        ):
+            raise ValueError(
+                "eagle_acceptance_target_max_draft_rounds must be greater "
+                "than or equal to 1 when eagle_acceptance_mode is "
+                f"{self.eagle_acceptance_mode}, but got "
+                f"{self.eagle_acceptance_target_max_draft_rounds}."
+            )
+        if (
+            self.eagle_acceptance_mode
+            == EAGLE_ACCEPTANCE_MODE_TARGET_MAX_INTERVAL_DRAFT_ROUNDS
+            and self.eagle_acceptance_target_max_draft_rounds < 1
+        ):
+            raise ValueError(
+                "eagle_acceptance_target_max_draft_rounds must be greater "
+                "than or equal to 1 when eagle_acceptance_mode is "
+                f"{self.eagle_acceptance_mode}, but got "
+                f"{self.eagle_acceptance_target_max_draft_rounds}."
+            )
+        if (
+            self.eagle_acceptance_mode
+            == EAGLE_ACCEPTANCE_MODE_TARGET_MAX_INTERVAL_DRAFT_ROUNDS
+            and self.eagle_acceptance_target_max_draft_interval
+            > self.eagle_acceptance_target_max_draft_rounds
+        ):
+            raise ValueError(
+                "eagle_acceptance_target_max_draft_interval must be less "
+                "than or equal to eagle_acceptance_target_max_draft_rounds "
+                "when eagle_acceptance_mode is "
+                f"{EAGLE_ACCEPTANCE_MODE_TARGET_MAX_INTERVAL_DRAFT_ROUNDS}, "
+                "but got "
+                f"{self.eagle_acceptance_target_max_draft_interval} > "
+                f"{self.eagle_acceptance_target_max_draft_rounds}."
+            )
+
+        self.eagle_acceptance_fallback_mode = additional_config.get(
+            "eagle_acceptance_fallback_mode",
+            EAGLE_ACCEPTANCE_FALLBACK_MODE_LEGACY,
+        )
+        if self.eagle_acceptance_fallback_mode not in _VALID_EAGLE_FALLBACK_MODES:
+            valid_modes = ", ".join(sorted(_VALID_EAGLE_FALLBACK_MODES))
+            raise ValueError(
+                f"Unsupported eagle_acceptance_fallback_mode: "
+                f"{self.eagle_acceptance_fallback_mode}. "
+                f"Valid modes: {valid_modes}"
+            )
+        if (
+            self.eagle_acceptance_fallback_mode
+            != EAGLE_ACCEPTANCE_FALLBACK_MODE_LEGACY
+            and self.eagle_acceptance_mode
+            != EAGLE_ACCEPTANCE_MODE_TARGET_MAX_FIRST_DRAFT_ROUNDS
+        ):
+            raise ValueError(
+                "eagle_acceptance_fallback_mode must be 'legacy' unless "
+                "eagle_acceptance_mode is "
+                f"{EAGLE_ACCEPTANCE_MODE_TARGET_MAX_FIRST_DRAFT_ROUNDS}, "
+                f"but got eagle_acceptance_mode={self.eagle_acceptance_mode} "
+                f"with fallback_mode={self.eagle_acceptance_fallback_mode}."
+            )
+
+        if self.eagle_acceptance_mode in (
+            EAGLE_ACCEPTANCE_MODE_TARGET_MAX,
+            EAGLE_ACCEPTANCE_MODE_TARGET_MAX_FIRST_DRAFT_ROUNDS,
+            EAGLE_ACCEPTANCE_MODE_TARGET_MAX_INTERVAL_DRAFT_ROUNDS,
+            EAGLE_ACCEPTANCE_MODE_DRAFT_PROBS,
+            EAGLE_ACCEPTANCE_MODE_ALPHA,
+            EAGLE_ACCEPTANCE_MODE_ENTROPY_VERIFIED,
+            EAGLE_ACCEPTANCE_MODE_TARGET_MAX_PERIODIC,
+        ):
+            speculative_config = vllm_config.speculative_config
+            speculative_method = getattr(speculative_config, "method", None)
+            if speculative_method not in ("eagle", "eagle3", "mtp"):
+                logger.warning_once(
+                    "additional_config.eagle_acceptance_mode only affects "
+                    "EAGLE/EAGLE3/MTP speculative decoding."
+                )
+            requires_draft_probs = (
+                self.eagle_acceptance_mode == EAGLE_ACCEPTANCE_MODE_DRAFT_PROBS
+                or (
+                    self.eagle_acceptance_mode
+                    == EAGLE_ACCEPTANCE_MODE_TARGET_MAX_PERIODIC
+                    and self.eagle_acceptance_secondary_mode
+                    == EAGLE_ACCEPTANCE_MODE_DRAFT_PROBS
+                )
+                or self.eagle_acceptance_fallback_mode
+                == EAGLE_ACCEPTANCE_FALLBACK_MODE_DRAFT_PROBS
+            )
+            if requires_draft_probs and speculative_method == "mtp":
+                raise ValueError(
+                    "draft_probs acceptance mode is not supported with MTP on "
+                    "Ascend NPU. The F.softmax operation for collecting draft "
+                    "probabilities is incompatible with MTP's ACL Graph capture. "
+                    "Use alternative modes instead: legacy, target_max, alpha, "
+                    "or entropy_verified."
+                )
+            if requires_draft_probs and speculative_method != "mtp" and getattr(
+                speculative_config, "disable_padded_drafter_batch", False
+            ):
+                raise ValueError(
+                    "eagle_acceptance_mode=draft_probs requires padded EAGLE "
+                    "drafter batches. Set disable_padded_drafter_batch=False."
+                )
+            if (
+                self.eagle_acceptance_fallback_mode
+                == EAGLE_ACCEPTANCE_FALLBACK_MODE_DRAFT_PROBS
+                and speculative_method != "mtp"
+                and getattr(
+                    speculative_config, "disable_padded_drafter_batch", False
+                )
+            ):
+                raise ValueError(
+                    "eagle_acceptance_fallback_mode=draft_probs requires "
+                    "padded EAGLE drafter batches. Set "
+                    "disable_padded_drafter_batch=False."
+                )
+
+    @property
+    def eagle_hybrid_mode_enabled(self) -> bool:
+        """True when target_max_first_draft_rounds uses non-legacy fallback."""
+        return (
+            self.eagle_acceptance_mode
+            == EAGLE_ACCEPTANCE_MODE_TARGET_MAX_FIRST_DRAFT_ROUNDS
+            and self.eagle_acceptance_fallback_mode
+            != EAGLE_ACCEPTANCE_FALLBACK_MODE_LEGACY
+        )
 
     @staticmethod
     def _get_config_value(additional_config: dict[str, Any], config_key: str, env_key: str, env_value: Any) -> Any:
