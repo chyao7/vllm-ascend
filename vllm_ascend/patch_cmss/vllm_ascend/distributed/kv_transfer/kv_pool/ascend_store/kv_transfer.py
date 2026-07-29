@@ -23,31 +23,15 @@ class KVTransferThread(_target.KVTransferThread):
                 skip_null_blocks: bool = False,
                 cache_role: str = "kv",
             ):
-                process_key_strings = getattr(self.token_database, "process_token_key_strings_with_block_ids", None)
-                if process_key_strings is not None:
-                    return process_key_strings(
-                        token_len,
-                        block_hashes,
-                        block_ids,
-                        mask_num=mask_num,
-                        kv_cache_group_id=kv_cache_group_id,
-                        skip_null_blocks=skip_null_blocks,
-                        cache_role=cache_role,
-                    )
-
-                def iter_with_pool_keys():
-                    for start, end, key, block_id in self._process_tokens_with_block_ids(
-                        token_len,
-                        block_hashes,
-                        block_ids,
-                        mask_num,
-                        kv_cache_group_id=kv_cache_group_id,
-                        skip_null_blocks=skip_null_blocks,
-                        cache_role=cache_role,
-                    ):
-                        yield start, end, key.to_string(), getattr(key, "chunk_hash_bytes", key.chunk_hash), block_id
-
-                return iter_with_pool_keys()
+                return self.token_database.process_token_key_strings_with_block_ids(
+                    token_len,
+                    block_hashes,
+                    block_ids,
+                    mask_num=mask_num,
+                    kv_cache_group_id=kv_cache_group_id,
+                    skip_null_blocks=skip_null_blocks,
+                    cache_role=cache_role,
+                )
 
 class KVCacheStoreSendingThread(_target.KVCacheStoreSendingThread):
             def _handle_request(self, req_meta: ReqMeta):
@@ -65,7 +49,14 @@ class KVCacheStoreSendingThread(_target.KVCacheStoreSendingThread):
                         self.request_queue.task_done()
                         return
 
-                    store_masks = self._store_mask(req_meta)
+                    try:
+                        store_masks = self.token_database.store_mask(
+                            req_meta.token_len_chunk,
+                            req_meta.num_prompt_tokens,
+                        )
+                    except AssertionError as exc:
+                        logger.debug("Skip AscendStore store mask for unaligned request %s: %s", req_id, exc)
+                        store_masks = None
                     group_ids = req_meta.kv_cache_group_ids or [0]
 
                     group_collected: dict[int, tuple[list, list, list, list, list, list]] = {}
@@ -88,7 +79,7 @@ class KVCacheStoreSendingThread(_target.KVCacheStoreSendingThread):
                             kv_cache_group_id=group_id,
                             skip_null_blocks=self._skip_null_blocks(req_meta, group_id),
                         ):
-                            if not self._mask_allows_chunk(store_masks, group_id, start):
+                            if not self.token_database.mask_allows_chunk(store_masks, group_id, start):
                                 continue
                             starts.append(start)
                             ends.append(end)
@@ -98,7 +89,6 @@ class KVCacheStoreSendingThread(_target.KVCacheStoreSendingThread):
 
                         if (
                             not self.dcp_size > 1
-                            and not req_meta.disable_tp_key_sharding
                             and not self.group_uses_align_state[group_id]
                         ):
                             starts = starts[self.tp_rank % self.put_step :: self.put_step]
@@ -211,7 +201,9 @@ class KVCacheStoreSendingThread(_target.KVCacheStoreSendingThread):
                         if self.enable_kv_event and all_stored_events:
                             self.update_kv_event(all_stored_events)
                 finally:
-                    self.mark_completed_events(req_meta.event_id)
+                    if req_meta.event_id is not None:
+                        with self.completed_events_lock:
+                            self.completed_events[req_meta.event_id] = 1
                 self.dec_stored_request(req_id)
                 if self.stored_requests.get(req_id, -1) == 0:
                     self.delete_finished_stored_request(req_id)
@@ -244,7 +236,7 @@ class KVCacheStoreRecvingThread(_target.KVCacheStoreRecvingThread):
                     key_list = []
                     block_id_list: list[int] = []
                     group_ids = req_meta.kv_cache_group_ids or [0]
-                    load_masks = self._load_mask(req_meta, token_len)
+                    load_masks = self.token_database.load_mask(req_meta.block_hashes, token_len)
                     for group_id in group_ids:
                         block_ids = req_meta.block_ids_by_group[group_id]
                         group_block_size = self._get_block_size(group_id)
@@ -261,7 +253,7 @@ class KVCacheStoreRecvingThread(_target.KVCacheStoreRecvingThread):
                             kv_cache_group_id=group_id,
                             skip_null_blocks=self._skip_null_blocks(req_meta, group_id),
                         ):
-                            if not self._mask_allows_chunk(load_masks, group_id, start):
+                            if not self.token_database.mask_allows_chunk(load_masks, group_id, start):
                                 continue
                             addr, size, block_id = self._prepare_value(
                                 start,
