@@ -124,9 +124,19 @@ def model_uses_sfa_sparse(model_config: Any | None) -> bool:
 
 def enable_sfa_dcp_replicated_indexer(vllm_config: VllmConfig | None = None) -> bool:
     if vllm_config is None:
-        from vllm.config import get_current_vllm_config
+        try:
+            from vllm.config import get_current_vllm_config
 
-        vllm_config = get_current_vllm_config()
+            vllm_config = get_current_vllm_config()
+        except AssertionError:
+            # Dummy-batch / idle DP paths may call get_impl_cls() outside
+            # set_current_vllm_config(); fall back to ascend-held config.
+            try:
+                vllm_config = get_ascend_config().vllm_config
+            except Exception:
+                return False
+    if vllm_config is None:
+        return False
 
     parallel_config = vllm_config.parallel_config
     return (

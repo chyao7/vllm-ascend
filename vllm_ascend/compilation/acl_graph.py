@@ -15,7 +15,7 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphOptions
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
@@ -277,7 +277,11 @@ def update_full_graph_params(
     num_dcp_pcp_tokens=None,
     draft_attn_metadatas=None,
 ):
-    impl_cls = attn_backend.get_impl_cls()
+    # get_impl_cls() may call enable_sfa_dcp_replicated_indexer(), which reads
+    # get_current_vllm_config(). Dummy-batch / idle paths do not always enter a
+    # set_current_vllm_config() context, so set it explicitly here.
+    with set_current_vllm_config(vllm_config):
+        impl_cls = attn_backend.get_impl_cls()
     impl_cls.update_graph_params(
         update_stream,
         forward_context,

@@ -279,15 +279,25 @@ class AscendConfig:
 
         self.enable_sparse_sfa_c8 = additional_config.get("enable_sparse_sfa_c8", False) and use_sparse
         self.enable_sparse_li_c8 = additional_config.get("enable_sparse_li_c8", False) and use_sparse
-        self.c8_enable_reshape_optim = self.enable_sparse_li_c8 and additional_config.get(
-            "c8_enable_reshape_optim", False
-        )
+        # Unified A2/A3 C8 path (merged Dtile + MLAPO): forces SFA/LI C8 layout flags so
+        # model_runner allocates int8 packed KV + indexer scale caches.
+        self.enable_sparse_c8 = additional_config.get("enable_sparse_c8", False) and use_sparse
+        if self.enable_sparse_c8:
+            self.enable_sparse_sfa_c8 = True
+            self.enable_sparse_li_c8 = True
+        self.c8_enable_reshape_optim = (
+            self.enable_sparse_li_c8 or self.enable_sparse_c8
+        ) and additional_config.get("c8_enable_reshape_optim", False)
         quant_config = getattr(vllm_config, "quant_config", None)
         (
             self._sparse_li_c8_layer_ids,
             self._sparse_li_c8_layer_names,
         ) = self._parse_sparse_li_c8_layers_from_quant_config(quant_config)
         self._sparse_li_c8_layer_filter_enabled = self._has_sparse_li_c8_layer_config(quant_config)
+        # Reuse LI indexer quant_type filter for unified enable_sparse_c8 layer gating.
+        self._sparse_c8_layer_ids = self._sparse_li_c8_layer_ids
+        self._sparse_c8_layer_names = self._sparse_li_c8_layer_names
+        self._sparse_c8_layer_filter_enabled = self._sparse_li_c8_layer_filter_enabled
         self.enable_sp_by_pass = (
             vllm_config.model_config is not None
             and not vllm_config.model_config.enforce_eager
@@ -460,6 +470,26 @@ class AscendConfig:
 
         layer_ids = {extract_layer_index(normalized_layer_name)}
         return any(layer_id in self._sparse_li_c8_layer_ids for layer_id in layer_ids)
+
+    def is_sparse_c8_layer(self, layer_name: str | None) -> bool:
+        """Gate unified enable_sparse_c8 (merged Dtile) per layer via indexer quant config."""
+        if not self.enable_sparse_c8:
+            return False
+        if not self._sparse_c8_layer_filter_enabled:
+            return True
+        if layer_name is None:
+            return False
+
+        normalized_layer_name = layer_name.rstrip(".")
+        if any(
+            normalized_layer_name == candidate or normalized_layer_name.startswith(f"{candidate}.")
+            for candidate in self._sparse_c8_layer_names
+        ):
+            return True
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        layer_ids = {extract_layer_index(normalized_layer_name)}
+        return any(layer_id in self._sparse_c8_layer_ids for layer_id in layer_ids)
 
     @staticmethod
     def _get_compile_ranges(compilation_config):

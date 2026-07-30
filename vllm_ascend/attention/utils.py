@@ -122,8 +122,13 @@ def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig, head_size
 
 @lru_cache(maxsize=1)
 def enable_cp():
-    prefill_config = get_current_vllm_config().parallel_config
-    return prefill_config.prefill_context_parallel_size > 1 or prefill_config.decode_context_parallel_size > 1
+    try:
+        parallel_config = get_current_vllm_config().parallel_config
+    except AssertionError:
+        # get_impl_cls() can run on dummy-batch paths without
+        # set_current_vllm_config(); fall back to ascend-held config.
+        parallel_config = get_ascend_config().vllm_config.parallel_config
+    return parallel_config.prefill_context_parallel_size > 1 or parallel_config.decode_context_parallel_size > 1
 
 
 @dataclass

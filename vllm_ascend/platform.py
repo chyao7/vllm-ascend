@@ -723,7 +723,13 @@ class NPUPlatform(Platform):
                     f"DCP for SFA is only supported when dcp_size({parallel_config.decode_context_parallel_size}) "
                     f"== tp_size({parallel_config.tensor_parallel_size})."
                 )
-            enable_sparse_c8 = (ascend_config.enable_sparse_sfa_c8 or ascend_config.enable_sparse_li_c8) and use_sparse
+            # A5 fused CKV quant SFA lacks DCP LSE merge. A2/A3 enable_sparse_c8 + DCP
+            # uses custom _C_ascend kv-quant SFA with return_softmax_lse.
+            enable_sparse_c8 = (
+                ascend_config.enable_sparse_c8
+                or ascend_config.enable_sparse_sfa_c8
+                or ascend_config.enable_sparse_li_c8
+            ) and use_sparse
             if enable_sparse_c8 and get_ascend_device_type() == AscendDeviceType.A5:
                 raise NotImplementedError(
                     "SFA DCP with sparse C8 cache is not supported on A5 yet. "

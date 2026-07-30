@@ -967,10 +967,11 @@ class AscendSFADCPImpl(AscendSFAImpl):
             kv_sharing_target_layer_name,
             **kwargs,
         )
-        # DCP shards only the SFA KV cache. MLAPO writes the SFA KV cache
-        # internally, so keep DCP on the native path where we pass the DCP
-        # slot mapping explicitly.
-        self.enable_mlapo = False
+        # DCP shards only the SFA KV cache. Non-C8 MLAPO embeds KV writes that do
+        # not take DCP-local slots, so keep those on the native path. enable_sparse_c8
+        # merged_dtile MLAPO writes via slot_mapping_sfa and must stay enabled for DCP.
+        if not self.enable_sparse_c8:
+            self.enable_mlapo = False
         dcp_group = get_dcp_group()
         self.dcp_size = dcp_group.world_size
         self.dcp_rank = dcp_group.rank_in_group if self.dcp_size > 1 else 0
