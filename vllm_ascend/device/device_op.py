@@ -399,7 +399,25 @@ class BaseDeviceAdaptor:
         sin: torch.Tensor,
         slot_mapping: torch.Tensor,
         num_input_tokens: int,
+        num_valid_tokens: int | None = None,
+        dtile_rows_out: torch.Tensor | None = None,
     ) -> tuple:
+        use_c8 = getattr(sfa_impl, "enable_sparse_c8", False)
+        if use_c8 and getattr(sfa_impl, "mlapo_is_quantized", False):
+            from vllm_ascend.attention.sfa_w8a8_ops import run_mla_prolog_v3_preprocess
+
+            return run_mla_prolog_v3_preprocess(
+                sfa_impl,
+                hidden_states,
+                kv_cache,
+                cos,
+                sin,
+                slot_mapping,
+                num_input_tokens,
+                num_valid_tokens,
+                dtile_rows_out=dtile_rows_out,
+            )
+
         k_nope, k_pe = kv_cache[0], kv_cache[1]
         ql_nope = torch.empty(
             (num_input_tokens, sfa_impl.W_UK_T.shape[0], k_nope.shape[-1]),
@@ -589,21 +607,31 @@ class BaseDeviceAdaptor:
         # DSV3.2 currently has graph compilation issues when using torch_npu.npu.lightning_indexer.
         # So two branches are maintained temporarily.
         # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
+        enable_sparse_c8 = getattr(sfa_impl, "enable_sparse_c8", False)
         packed_kv_cache = getattr(sfa_impl, "enable_sparse_sfa_c8", False)
-        indexer_cache_idx = 1 if packed_kv_cache else 2
-        indexer_scale_cache_idx = 2 if packed_kv_cache else 3
+        if enable_sparse_c8:
+            from vllm_ascend.attention.sfa_w8a8_ops import get_sparse_c8_dsa_cache_indices
 
-        if enable_sparse_li_c8:
-            assert len(kv_cache) == (3 if packed_kv_cache else 4)
+            indexer_cache_idx, indexer_scale_cache_idx = get_sparse_c8_dsa_cache_indices(kv_cache)
+        else:
+            indexer_cache_idx = 1 if packed_kv_cache else 2
+            indexer_scale_cache_idx = 2 if packed_kv_cache else 3
+
+        if enable_sparse_li_c8 or enable_sparse_c8:
+            assert len(kv_cache) == (3 if packed_kv_cache or enable_sparse_c8 else 4)
             assert q_li_scale is not None
             assert q_li_shape_ori is not None
-            weights = weights.to(torch.float16)
+            weights = BaseDeviceAdaptor.prepare_dsa_indexer_weights(weights)
+            q_li_scale = BaseDeviceAdaptor.prepare_dsa_indexer_query_scale(q_li_scale)
+            key_dequant_scale = BaseDeviceAdaptor.prepare_dsa_indexer_key_scale(
+                kv_cache[indexer_scale_cache_idx]
+            )
             topk_indices = torch.ops._C_ascend.npu_lightning_indexer_quant(
                 query=q_li.view(q_li_shape_ori),
                 key=kv_cache[indexer_cache_idx],
                 weights=weights,
                 query_dequant_scale=q_li_scale.view(q_li_shape_ori[:-1]),
-                key_dequant_scale=kv_cache[indexer_scale_cache_idx].squeeze(2),  # B S N D -> B S D
+                key_dequant_scale=key_dequant_scale,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
                 block_table=attn_metadata.block_table,
@@ -730,7 +758,27 @@ class BaseDeviceAdaptor:
         sparse_mode: int = 3,
         return_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Always use _C_ascend kv-quant SFA in-process. Calling
+        # torch_npu.npu_kv_quant_sparse_flash_attention after vllm_ascend_C is
+        # loaded segfaults (see benchmarks/scripts/bench_kv_quant_sparse_flash_attention.py).
+        # Match 0.22 serving: key/value share the packed Dtile buffer (no knope
+        # materialize via packed_kv_value_nope().contiguous()).
+        # Drop hardcoded return_softmax_lse=True: follow return_lse.
+        # enable_sparse_c8 decode (sfa_v1) leaves return_lse=False → no LSE.
+        use_sparse_c8 = getattr(sfa_impl, "enable_sparse_c8", False)
+
+        from vllm_ascend.attention.sfa_w8a8_ops import MLA_PROLOG_V3_TILE_SIZE
+
         query = torch.cat([ql_nope, q_pe], dim=-1).contiguous()
+        tile_size = (
+            MLA_PROLOG_V3_TILE_SIZE
+            if use_sparse_c8
+            else getattr(sfa_impl, "sfa_qsfa_tile_size", 128)
+        )
+        rope_head_dim = getattr(sfa_impl, "qk_rope_head_dim", q_pe.shape[-1])
+        # enable_sparse_c8 normal path: return_lse=False → skip LSE.
+        # Only DCP merge passes return_lse=True and still needs max/sum.
+        return_softmax_lse = return_lse
         result = torch.ops._C_ascend.npu_kv_quant_sparse_flash_attention(
             query=query,
             key=kv,
@@ -746,11 +794,11 @@ class BaseDeviceAdaptor:
             sparse_mode=sparse_mode,
             attention_mode=2,
             quant_scale_repo_mode=1,
-            tile_size=getattr(sfa_impl, "sfa_qsfa_tile_size", 128),
+            tile_size=tile_size,
             key_quant_mode=2,
             value_quant_mode=2,
-            rope_head_dim=getattr(sfa_impl, "qk_rope_head_dim", q_pe.shape[-1]),
-            return_softmax_lse=True,
+            rope_head_dim=rope_head_dim,
+            return_softmax_lse=return_softmax_lse,
         )
         if not isinstance(result, tuple):
             if return_lse:
@@ -1170,6 +1218,8 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         return_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         query = torch.cat([ql_nope, q_pe], dim=-1).contiguous()
+        rope_head_dim = getattr(sfa_impl, "qk_rope_head_dim", q_pe.shape[-1])
+        # Match 0.22: share packed Dtile for key/value (no knope full-cache copy).
         result = torch_npu.npu_kv_quant_sparse_flash_attention(
             query=query,
             key=kv,
@@ -1188,7 +1238,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             tile_size=getattr(sfa_impl, "sfa_qsfa_tile_size", 128),
             key_quant_mode=2,
             value_quant_mode=2,
-            rope_head_dim=getattr(sfa_impl, "qk_rope_head_dim", q_pe.shape[-1]),
+            rope_head_dim=rope_head_dim,
         )
         if return_lse:
             raise RuntimeError(
@@ -1816,7 +1866,10 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         sin: torch.Tensor,
         slot_mapping: torch.Tensor,
         num_input_tokens: int,
+        num_valid_tokens: int | None = None,
+        dtile_rows_out: torch.Tensor | None = None,
     ) -> tuple:
+        del num_valid_tokens, dtile_rows_out  # A5 path writes paged cache in-op; unused.
         bsz = num_input_tokens
         slot_mapping = slot_mapping[:bsz]
         hidden_states_temp = hidden_states[:bsz].unsqueeze(1)
@@ -1830,7 +1883,9 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         sin = sin.view(cos_shape[0], 1, cos_shape[-1])
 
         decode_k_nope = kv_cache[0]
-        use_c8 = getattr(sfa_impl, "enable_sparse_sfa_c8", False)
+        use_c8 = getattr(sfa_impl, "enable_sparse_sfa_c8", False) or getattr(
+            sfa_impl, "enable_sparse_c8", False
+        )
         kr_cache = (
             torch.zeros(0, 0, decode_k_nope.shape[-2], cos_shape[-1], dtype=torch.bfloat16, device=decode_k_nope.device)
             if use_c8

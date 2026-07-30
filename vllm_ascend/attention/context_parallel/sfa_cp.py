@@ -431,9 +431,11 @@ class AscendSFACPImpl(AscendSFAImpl):
         sin: torch.Tensor,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
+        weights: torch.Tensor | None = None,
     ):
-        kw, _ = self.wk_weights_proj(x)
-        weights = kw[:, self.head_dim :]
+        if weights is None:
+            kw, _ = self.wk_weights_proj(x)
+            weights = kw[:, self.head_dim :]
         q_li, _ = self.wq_b(q_c)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
         q_li = q_li.view(-1, self.n_head, self.head_dim)  # [n_toks,64,128]
         if HAS_TRITON:
@@ -967,10 +969,11 @@ class AscendSFADCPImpl(AscendSFAImpl):
             kv_sharing_target_layer_name,
             **kwargs,
         )
-        # DCP shards only the SFA KV cache. MLAPO writes the SFA KV cache
-        # internally, so keep DCP on the native path where we pass the DCP
-        # slot mapping explicitly.
-        self.enable_mlapo = False
+        # DCP shards only the SFA KV cache. Non-C8 MLAPO embeds KV writes that do
+        # not take DCP-local slots, so keep those on the native path. enable_sparse_c8
+        # merged_dtile MLAPO writes via slot_mapping_sfa and must stay enabled for DCP.
+        if not self.enable_sparse_c8:
+            self.enable_mlapo = False
         dcp_group = get_dcp_group()
         self.dcp_size = dcp_group.world_size
         self.dcp_rank = dcp_group.rank_in_group if self.dcp_size > 1 else 0

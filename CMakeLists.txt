@@ -57,11 +57,15 @@ ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/*.cpp)
 set(VLLM_ASCEND_CUSTOM_OP
     ${KERNEL_FILES}
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/mla_preprocess/op_kernel/mla_preprocess_kernel.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/mla_preprocess_merged_dtile/op_kernel/mla_preprocess_merged_dtile_kernel.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/mla_preprocess_merged_dtile/op_kernel/mla_preprocess_merged_dtile_rows_kernel.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/batch_matmul_transpose/op_kernel/batch_matmul_transpose_kernel.cpp
 )
 
 set(VLLM_ASCEND_CUSTOM_OP_EXCLUDE_ASCEND950
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/mla_preprocess/op_kernel/mla_preprocess_kernel.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/mla_preprocess_merged_dtile/op_kernel/mla_preprocess_merged_dtile_kernel.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/mla_preprocess_merged_dtile/op_kernel/mla_preprocess_merged_dtile_rows_kernel.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/batch_matmul_transpose/op_kernel/batch_matmul_transpose_kernel.cpp
 )
 
@@ -99,6 +103,10 @@ include_directories(
   ${TORCH_NPU_PATH}/include
   ${ASCEND_HOME_PATH}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/csrc/batch_matmul_transpose/op_host
+  ${CMAKE_CURRENT_SOURCE_DIR}/csrc/mla_preprocess/op_kernel
+  ${CMAKE_CURRENT_SOURCE_DIR}/csrc/mla_preprocess/op_host
+  ${CMAKE_CURRENT_SOURCE_DIR}/csrc/mla_preprocess_merged_dtile/op_kernel
+  ${CMAKE_CURRENT_SOURCE_DIR}/csrc/mla_preprocess_merged_dtile/op_host
 )
 
 set(

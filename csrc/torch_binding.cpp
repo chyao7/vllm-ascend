@@ -33,6 +33,10 @@
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
 #include "batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
 #include "mla_preprocess/mla_preprocess_torch_adpt.h"
+// mla_preprocess.h has no include guard; mark it included so merged_dtile skips re-include.
+#define VLLM_ASCEND_MLA_PREPROCESS_HOST_INCLUDED
+#include "mla_preprocess_merged_dtile/mla_preprocess_merged_dtile_torch_adpt.h"
+#include "mla_preprocess_merged_dtile/mla_preprocess_merged_dtile_rows_torch_adpt.h"
 #endif
 #include "mc2/dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h"
 #include "mc2/dispatch_gmm_combine_decode/dispatch_gmm_combine_decode_torch_adpt.h"
@@ -2319,6 +2323,32 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                                          Tensor q_out1, Tensor kv_cache_out1, Tensor inner_out)"
     );
     ops.impl("mla_preprocess", torch::kPrivateUse1, &vllm_ascend::mla_preprocess);
+
+    ops.def(
+        "mla_preprocess_merged_dtile(Tensor hiddenState, Tensor wdqkv,"
+        "               Tensor? descale0, Tensor gamma1, Tensor? beta1, Tensor wuq, Tensor? descale1,"
+        "               Tensor gamma2, Tensor cos, Tensor sin, Tensor wuk, Tensor kv_cache,"
+        "               Tensor slotmapping, Tensor? quant_scale0,"
+        "               Tensor? quant_offset0, Tensor? bias0, Tensor? quant_scale1, Tensor? quant_offset1,"
+        "               Tensor? bias1, Tensor? ctkv_scale, Tensor? q_nope_scale,"
+        "               Tensor? k_nope_clip_alpha, Tensor? debug_trace_out,"
+        "               Tensor! q_out0, Tensor! kv_cache_out, Tensor! q_out1, Tensor! inner_out)"
+        " -> (Tensor q_out0, Tensor kv_cache_out, Tensor q_out1, Tensor inner_out)"
+    );
+    ops.impl("mla_preprocess_merged_dtile", torch::kPrivateUse1, &vllm_ascend::mla_preprocess_merged_dtile);
+
+    ops.def(
+        "mla_preprocess_merged_dtile_rows(Tensor hiddenState, Tensor wdqkv,"
+        "               Tensor? descale0, Tensor gamma1, Tensor? beta1, Tensor wuq, Tensor? descale1,"
+        "               Tensor gamma2, Tensor cos, Tensor sin, Tensor wuk, Tensor dtile_rows_out,"
+        "               Tensor slotmapping, Tensor? quant_scale0,"
+        "               Tensor? quant_offset0, Tensor? bias0, Tensor? quant_scale1, Tensor? quant_offset1,"
+        "               Tensor? bias1, Tensor? ctkv_scale, Tensor? q_nope_scale,"
+        "               Tensor? k_nope_clip_alpha, Tensor? debug_trace_out,"
+        "               Tensor! q_out0, Tensor! dtile_rows_out_ref, Tensor! q_out1, Tensor! inner_out)"
+        " -> (Tensor q_out0, Tensor dtile_rows_out_ref, Tensor q_out1, Tensor inner_out)"
+    );
+    ops.impl("mla_preprocess_merged_dtile_rows", torch::kPrivateUse1, &vllm_ascend::mla_preprocess_merged_dtile_rows);
 
     //batch_matmul ops refer to sgl-kernel-npu
     ops.def(

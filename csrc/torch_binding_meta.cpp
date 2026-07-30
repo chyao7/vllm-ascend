@@ -102,6 +102,116 @@ std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>
     return {q_out0, kv_cache_out0, q_out1, kv_cache_out1, inner_out};
 }
 
+std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &> mla_preprocess_merged_dtile(
+    const at::Tensor &hiddenState,
+    const at::Tensor &wdqkv,
+    const c10::optional<at::Tensor> &descale0,
+    const at::Tensor &gamma1,
+    const c10::optional<at::Tensor> &beta1,
+    const at::Tensor &wuq,
+    const c10::optional<at::Tensor> &descale1,
+    const at::Tensor &gamma2,
+    const at::Tensor &cos,
+    const at::Tensor &sin,
+    const at::Tensor &wuk,
+    const at::Tensor &kv_cache,
+    const at::Tensor &slotmapping,
+    const c10::optional<at::Tensor> &quant_scale0,
+    const c10::optional<at::Tensor> &quant_offset0,
+    const c10::optional<at::Tensor> &bias0,
+    const c10::optional<at::Tensor> &quant_scale1,
+    const c10::optional<at::Tensor> &quant_offset1,
+    const c10::optional<at::Tensor> &bias1,
+    const c10::optional<at::Tensor> &ctkv_scale,
+    const c10::optional<at::Tensor> &q_nope_scale,
+    const c10::optional<at::Tensor> &k_nope_clip_alpha,
+    const c10::optional<at::Tensor> &debug_trace_out,
+    at::Tensor &q_out0,
+    at::Tensor &kv_cache_out,
+    at::Tensor &q_out1,
+    at::Tensor &inner_out)
+{
+    (void)hiddenState;
+    (void)wdqkv;
+    (void)descale0;
+    (void)gamma1;
+    (void)beta1;
+    (void)wuq;
+    (void)descale1;
+    (void)gamma2;
+    (void)cos;
+    (void)sin;
+    (void)wuk;
+    (void)kv_cache;
+    (void)slotmapping;
+    (void)quant_scale0;
+    (void)quant_offset0;
+    (void)bias0;
+    (void)quant_scale1;
+    (void)quant_offset1;
+    (void)bias1;
+    (void)ctkv_scale;
+    (void)q_nope_scale;
+    (void)k_nope_clip_alpha;
+    (void)debug_trace_out;
+    return {q_out0, kv_cache_out, q_out1, inner_out};
+}
+
+std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &> mla_preprocess_merged_dtile_rows(
+    const at::Tensor &hiddenState,
+    const at::Tensor &wdqkv,
+    const c10::optional<at::Tensor> &descale0,
+    const at::Tensor &gamma1,
+    const c10::optional<at::Tensor> &beta1,
+    const at::Tensor &wuq,
+    const c10::optional<at::Tensor> &descale1,
+    const at::Tensor &gamma2,
+    const at::Tensor &cos,
+    const at::Tensor &sin,
+    const at::Tensor &wuk,
+    const at::Tensor &dtile_rows_out,
+    const at::Tensor &slotmapping,
+    const c10::optional<at::Tensor> &quant_scale0,
+    const c10::optional<at::Tensor> &quant_offset0,
+    const c10::optional<at::Tensor> &bias0,
+    const c10::optional<at::Tensor> &quant_scale1,
+    const c10::optional<at::Tensor> &quant_offset1,
+    const c10::optional<at::Tensor> &bias1,
+    const c10::optional<at::Tensor> &ctkv_scale,
+    const c10::optional<at::Tensor> &q_nope_scale,
+    const c10::optional<at::Tensor> &k_nope_clip_alpha,
+    const c10::optional<at::Tensor> &debug_trace_out,
+    at::Tensor &q_out0,
+    at::Tensor &dtile_rows_out_ref,
+    at::Tensor &q_out1,
+    at::Tensor &inner_out)
+{
+    (void)hiddenState;
+    (void)wdqkv;
+    (void)descale0;
+    (void)gamma1;
+    (void)beta1;
+    (void)wuq;
+    (void)descale1;
+    (void)gamma2;
+    (void)cos;
+    (void)sin;
+    (void)wuk;
+    (void)dtile_rows_out;
+    (void)slotmapping;
+    (void)quant_scale0;
+    (void)quant_offset0;
+    (void)bias0;
+    (void)quant_scale1;
+    (void)quant_offset1;
+    (void)bias1;
+    (void)ctkv_scale;
+    (void)q_nope_scale;
+    (void)k_nope_clip_alpha;
+    (void)debug_trace_out;
+    return {q_out0, dtile_rows_out_ref, q_out1, inner_out};
+}
+
 void batch_matmul_transpose(const at::Tensor &tensor_a, const at::Tensor &tensor_b, at::Tensor &tensor_c,
                                     c10::optional<c10::string_view> format_mode,
                                     c10::optional<c10::string_view> quant_mode)
@@ -1796,6 +1906,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("sgmv_expand", &vllm_ascend::meta::sgmv_expand_meta);
     // MLA preprocess
     ops.impl("mla_preprocess", &vllm_ascend::meta::mla_preprocess);
+    ops.impl("mla_preprocess_merged_dtile", &vllm_ascend::meta::mla_preprocess_merged_dtile);
+    ops.impl("mla_preprocess_merged_dtile_rows", &vllm_ascend::meta::mla_preprocess_merged_dtile_rows);
     // batch_matmul_transpose
     ops.impl("batch_matmul_transpose", &vllm_ascend::meta::batch_matmul_transpose);
 #endif
