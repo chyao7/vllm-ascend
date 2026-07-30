@@ -982,31 +982,52 @@ def _acquire_mla_query_buffers(
     dtype: torch.dtype,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reuse DSA-CP class-level Q pools when present; otherwise allocate.
+    """Reuse class-level Q pools (DSA-CP or sparse-C8) when present; else allocate.
 
-    Non-DSA-CP / non-C8 configs leave the pools as ``None``, preserving the
+    Non-C8 / non-DSA-CP configs leave the pools as ``None``, preserving the
     previous per-forward ``torch.empty`` behavior.
     """
-    ql_pool = getattr(sfa_impl, "dsa_cp_ql_nope_pool", None)
-    q_pe_pool = getattr(sfa_impl, "dsa_cp_q_pe_pool", None)
-    q_c_pool = getattr(sfa_impl, "dsa_cp_q_c_pool", None)
-    if (
-        ql_pool is not None
-        and q_pe_pool is not None
-        and q_c_pool is not None
-        and ql_pool.shape[0] >= num_tokens
-        and ql_pool.shape[1] >= nheads
-        and q_pe_pool.shape[0] >= num_tokens
-        and q_pe_pool.shape[1] >= nheads
-        and q_c_pool.shape[0] >= num_tokens
-        and ql_pool.dtype == dtype
-        and ql_pool.device == device
-    ):
-        return (
-            ql_pool[:num_tokens, :nheads],
-            q_pe_pool[:num_tokens, :nheads],
-            q_c_pool[:num_tokens],
-        )
+
+    def _try_pools(
+        ql_pool: torch.Tensor | None,
+        q_pe_pool: torch.Tensor | None,
+        q_c_pool: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if (
+            ql_pool is not None
+            and q_pe_pool is not None
+            and q_c_pool is not None
+            and ql_pool.shape[0] >= num_tokens
+            and ql_pool.shape[1] >= nheads
+            and q_pe_pool.shape[0] >= num_tokens
+            and q_pe_pool.shape[1] >= nheads
+            and q_c_pool.shape[0] >= num_tokens
+            and ql_pool.dtype == dtype
+            and ql_pool.device == device
+        ):
+            return (
+                ql_pool[:num_tokens, :nheads],
+                q_pe_pool[:num_tokens, :nheads],
+                q_c_pool[:num_tokens],
+            )
+        return None
+
+    # Prefer DSA-CP local pools when sized for this rank; fall back to sparse-C8 pools.
+    reused = _try_pools(
+        getattr(sfa_impl, "dsa_cp_ql_nope_pool", None),
+        getattr(sfa_impl, "dsa_cp_q_pe_pool", None),
+        getattr(sfa_impl, "dsa_cp_q_c_pool", None),
+    )
+    if reused is not None:
+        return reused
+    reused = _try_pools(
+        getattr(sfa_impl, "sparse_c8_ql_nope_pool", None),
+        getattr(sfa_impl, "sparse_c8_q_pe_pool", None),
+        getattr(sfa_impl, "sparse_c8_q_c_pool", None),
+    )
+    if reused is not None:
+        return reused
+
     ql_nope = torch.empty((num_tokens, nheads, hckv), dtype=dtype, device=device)
     q_pe = torch.empty((num_tokens, nheads, dr), dtype=dtype, device=device)
     q_c = torch.empty((num_tokens, sfa_impl.q_lora_rank), dtype=dtype, device=device)

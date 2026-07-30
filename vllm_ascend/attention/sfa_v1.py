@@ -581,6 +581,11 @@ class AscendSFAImpl(MLAAttentionImpl):
     sparse_c8_scatter_slot_pool: torch.Tensor | None = None
     sparse_c8_k_li_pool: torch.Tensor | None = None
     sparse_c8_k_li_scale_pool: torch.Tensor | None = None
+    # Sparse C8 MLAPO Q outputs + v_up_proj out (shared across layers).
+    sparse_c8_ql_nope_pool: torch.Tensor | None = None
+    sparse_c8_q_pe_pool: torch.Tensor | None = None
+    sparse_c8_q_c_pool: torch.Tensor | None = None
+    sparse_c8_v_up_pool: torch.Tensor | None = None
 
     # q_hadamard and k_hadamard tensor shared when dsa c8 enabled
     q_hadamard: torch.Tensor | None = None
@@ -891,15 +896,52 @@ class AscendSFAImpl(MLAAttentionImpl):
             self._ensure_sparse_c8_graph_buffers(self.kv_a_layernorm.weight.device)
 
     def _ensure_sparse_c8_graph_buffers(self, device: torch.device) -> None:
-        """Pre-allocate class-level ACL-graph-safe buffers for sparse C8 KV scatter."""
-        if AscendSFAImpl.sparse_c8_k_li_pool is not None:
-            return
+        """Pre-allocate class-level ACL-graph-safe buffers for sparse C8 paths."""
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
-        AscendSFAImpl.sparse_c8_scatter_slot_pool = torch.zeros(max_tokens, dtype=torch.int32, device=device)
-        AscendSFAImpl.sparse_c8_k_li_pool = torch.zeros(max_tokens, self.head_dim, dtype=torch.int8, device=device)
-        AscendSFAImpl.sparse_c8_k_li_scale_pool = torch.zeros(max_tokens, 1, dtype=torch.float16, device=device)
+        if AscendSFAImpl.sparse_c8_k_li_pool is None:
+            AscendSFAImpl.sparse_c8_scatter_slot_pool = torch.zeros(max_tokens, dtype=torch.int32, device=device)
+            AscendSFAImpl.sparse_c8_k_li_pool = torch.zeros(max_tokens, self.head_dim, dtype=torch.int8, device=device)
+            AscendSFAImpl.sparse_c8_k_li_scale_pool = torch.zeros(max_tokens, 1, dtype=torch.float16, device=device)
+        if AscendSFAImpl.sparse_c8_ql_nope_pool is None:
+            act_dtype = self.kv_a_layernorm.weight.dtype  # type: ignore[union-attr]
+            nheads = self.local_num_heads
+            AscendSFAImpl.sparse_c8_ql_nope_pool = torch.empty(
+                max_tokens, nheads, self.kv_lora_rank, dtype=act_dtype, device=device
+            )
+            AscendSFAImpl.sparse_c8_q_pe_pool = torch.empty(
+                max_tokens, nheads, self.qk_rope_head_dim, dtype=act_dtype, device=device
+            )
+            AscendSFAImpl.sparse_c8_q_c_pool = torch.empty(
+                max_tokens, self.q_lora_rank, dtype=act_dtype, device=device
+            )
+            AscendSFAImpl.sparse_c8_v_up_pool = torch.empty(
+                max_tokens, nheads, self.v_head_dim, dtype=act_dtype, device=device
+            )
         if self.enable_dsa_cp:
             self._ensure_dsa_cp_dtile_pools(device, max_tokens)
+
+    def _acquire_v_up_buffer(
+        self,
+        num_tokens: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Reuse sparse-C8 class pool for batch_matmul_transpose output when possible."""
+        pool = AscendSFAImpl.sparse_c8_v_up_pool
+        if (
+            pool is not None
+            and pool.shape[0] >= num_tokens
+            and pool.shape[1] >= self.local_num_heads
+            and pool.shape[2] >= self.v_head_dim
+            and pool.dtype == dtype
+            and pool.device == device
+        ):
+            return pool[:num_tokens, : self.local_num_heads, : self.v_head_dim]
+        return torch.empty(
+            (num_tokens, self.local_num_heads, self.v_head_dim),
+            dtype=dtype,
+            device=device,
+        )
 
     def _ensure_dsa_cp_dtile_pools(self, device: torch.device, max_tokens: int) -> None:
         """Allocate class-level DSA-CP staging buffers once (reused by every layer)."""
@@ -1439,7 +1481,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             and num_input_tokens <= BMM_TRANS_MAX_SUPPORTED_TOKENS
         ):
             x = x.view(-1, self.local_num_heads, self.kv_lora_rank)
-            res = torch.empty((num_input_tokens, self.local_num_heads, self.v_head_dim), dtype=x.dtype, device=x.device)
+            res = self._acquire_v_up_buffer(num_input_tokens, x.dtype, x.device)
             torch.ops._C_ascend.batch_matmul_transpose(x, self.W_UV, res)
             x = res.reshape(-1, self.local_num_heads * self.v_head_dim)
         elif hasattr(torch_npu, "npu_transpose_batchmatmul"):
@@ -1527,6 +1569,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ):
+        """Build indexer key (and scale); also return weights from the same proj.
+
+        ``wk_weights_proj`` produces ``[k_li | weights]`` in one matmul. Returning
+        both here avoids a second ``wk_weights_proj`` in ``indexer_select_post_process``.
+        """
         if not self.has_indexer:
             raise RuntimeError(
                 f"indexer_select_pre_process should not be called when indexer is None. layer_name={self.layer_name}."
@@ -1537,6 +1584,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         kw, _ = self.wk_weights_proj(x)
         k_li = kw[:, : self.head_dim]
+        weights = kw[:, self.head_dim :]
         k_li = self.k_norm(k_li).unsqueeze(1)
         k_li = k_li.view(-1, 1, self.head_dim)
 
@@ -1568,7 +1616,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             k_li_scale = None
 
-        return k_li, k_li_scale
+        return k_li, k_li_scale, weights
 
     def indexer_select_post_process(
         self,
@@ -1580,17 +1628,20 @@ class AscendSFAImpl(MLAAttentionImpl):
         sin: torch.Tensor,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
+        weights: torch.Tensor | None = None,
     ):
         if not self.has_indexer:
             raise RuntimeError(
                 f"indexer_select_post_process should not be called when indexer is None. layer_name={self.layer_name}."
             )
 
-        assert self.wk_weights_proj is not None
         assert self.wq_b is not None
 
-        kw, _ = self.wk_weights_proj(x)
-        weights = kw[:, self.head_dim :]
+        # Prefer weights from indexer_select_pre_process (same wk_weights_proj).
+        if weights is None:
+            assert self.wk_weights_proj is not None
+            kw, _ = self.wk_weights_proj(x)
+            weights = kw[:, self.head_dim :]
         if isinstance(q_c, tuple):
             q_c_tensor, q_c_scale = q_c
             q_c_tensor = q_c_tensor.view(-1, q_c_tensor.shape[-1])
@@ -1906,6 +1957,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         }
 
         mlapo_dsa_cp_kv_synced = False
+        indexer_weights: torch.Tensor | None = None
         if self.enable_sfa_prolog_v3 and attn_metadata.attn_state in (
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
@@ -1919,9 +1971,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 f"got token_x={hidden_states.shape[0]} and cache_index={slot_mapping.numel()}."
             )
             if self.has_indexer:
-                k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
+                k_li, k_li_scale, indexer_weights = self.indexer_select_pre_process(
+                    x=hidden_states, cos=cos, sin=sin
+                )
             else:
-                k_li, k_li_scale = None, None
+                k_li, k_li_scale, indexer_weights = None, None, None
 
             # Prolog updates the paged KV cache in place. Wait for the prompt
             # blocks before writing the first Decode token into their tail block.
@@ -1966,7 +2020,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
                 if use_dtile_rows_op and dtile_rows_out is not None and local_num_valid < local_num_pad:
                     dtile_rows_out[local_num_valid:local_num_pad].zero_()
-                k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
+                k_li, k_li_scale, indexer_weights = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
                 if local_num_valid < local_num_pad:
                     k_li[local_num_valid:local_num_pad].zero_()
                     if k_li_scale is not None:
@@ -2018,7 +2072,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     num_valid_tokens=num_valid_tokens if self.enable_sparse_c8 else None,
                 )
                 if self.has_indexer:
-                    k_li, k_li_scale = self.indexer_select_pre_process(
+                    k_li, k_li_scale, indexer_weights = self.indexer_select_pre_process(
                         x=hidden_states,
                         cos=cos,
                         sin=sin,
@@ -2028,7 +2082,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         if k_li_scale is not None:
                             k_li_scale[num_valid_tokens:num_input_tokens].zero_()
                 else:
-                    k_li, k_li_scale = None, None
+                    k_li, k_li_scale, indexer_weights = None, None, None
                 wait_for_kv_layer_from_connector(layer_name)
 
             # DCP: start Q/KV gathers after MLAPO has populated the SFA KV cache
@@ -2057,13 +2111,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_c = self.q_a_layernorm(q_c)
 
             if self.has_indexer:
-                k_li, k_li_scale = self.indexer_select_pre_process(
+                k_li, k_li_scale, indexer_weights = self.indexer_select_pre_process(
                     x=hidden_states,
                     cos=cos,
                     sin=sin,
                 )
             else:
-                k_li, k_li_scale = None, None
+                k_li, k_li_scale, indexer_weights = None, None, None
 
             wait_for_kv_layer_from_connector(layer_name)
 
@@ -2291,6 +2345,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sin=sin,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
+                weights=indexer_weights,
             )
             if self.use_index_cache:
                 self._update_indexcache_topk_indices(topk_indices)
