@@ -35,6 +35,10 @@ if vllm_version_is("0.23.0"):
     import vllm_ascend.patch.platform.patch_glm47_tool_call_parser  # noqa
     import vllm_ascend.patch.platform.patch_minimax_m2_tool_call_parser  # noqa
     import vllm_ascend.patch.platform.patch_minimax_usage_accounting  # noqa
+from vllm_ascend.patch_cmss import apply as apply_cmss_patch
+
+apply_cmss_patch()
+
 import vllm_ascend.patch.platform.patch_deepseek_v4_tool_call_parser  # noqa
 import vllm_ascend.patch.platform.patch_structured_output  # noqa
 import vllm_ascend.patch.platform.patch_weight_transfer_engine  # noqa

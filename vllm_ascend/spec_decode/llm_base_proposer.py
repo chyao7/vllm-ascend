@@ -41,7 +41,12 @@ from vllm.v1.spec_decode.utils import (
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_config import (
+    EAGLE_ACCEPTANCE_FALLBACK_MODE_DRAFT_PROBS,
+    EAGLE_ACCEPTANCE_MODE_DRAFT_PROBS,
+    EAGLE_ACCEPTANCE_MODE_TARGET_MAX_PERIODIC,
+    get_ascend_config,
+)
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -231,6 +236,44 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     "(enforce_eager=true). Graph mode support for GLM "
                     "speculative decoding will be added in a future release. "
                 )
+            self.use_cuda_graph = False
+
+        ascend_config = self.runner.ascend_config if self.runner is not None else get_ascend_config()
+        eagle_acceptance_mode = getattr(ascend_config, "eagle_acceptance_mode", None)
+        # draft_probs collection is disabled for MTP on Ascend NPU:
+        # F.softmax for full vocab is incompatible with MTP's ACL Graph capture.
+        # EAGLE/EAGLE3 draft_probs collection remains functional.
+        self.collect_draft_probs = (
+            self.method in ("eagle", "eagle3")
+            and (
+                eagle_acceptance_mode == EAGLE_ACCEPTANCE_MODE_DRAFT_PROBS
+                or (
+                    eagle_acceptance_mode == EAGLE_ACCEPTANCE_MODE_TARGET_MAX_PERIODIC
+                    and getattr(
+                        ascend_config,
+                        "eagle_acceptance_secondary_mode",
+                        None,
+                    )
+                    == EAGLE_ACCEPTANCE_MODE_DRAFT_PROBS
+                )
+                or (
+                    getattr(ascend_config, "eagle_hybrid_mode_enabled", False)
+                    and getattr(
+                        ascend_config,
+                        "eagle_acceptance_fallback_mode",
+                        None,
+                    )
+                    == EAGLE_ACCEPTANCE_FALLBACK_MODE_DRAFT_PROBS
+                )
+            )
+        )
+        self.last_draft_probs: torch.Tensor | None = None
+        if self.collect_draft_probs and self.use_cuda_graph:
+            logger.warning_once(
+                "Disabling EAGLE drafter graph capture because "
+                "eagle_acceptance_mode=draft_probs requires collecting "
+                "per-step draft probabilities."
+            )
             self.use_cuda_graph = False
 
         # TODO: Remove it when the bug of fx-graph is solved
@@ -1060,6 +1103,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_tokens,
         is_prefill=None,
     ) -> torch.Tensor:
+        draft_probs_steps: list[torch.Tensor] | None = (
+            [] if self.collect_draft_probs else None
+        )
+        if self.collect_draft_probs:
+            self.last_draft_probs = None
+
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
         # `model_hidden_states` represent the speculative model inputs.
@@ -1139,7 +1188,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
 
-        if get_ascend_config().enable_reduce_sample:
+        if self.collect_draft_probs:
+            logits = self.model.compute_logits(sample_hidden_states)
+            if lmhead_tp_enable():
+                logits, token_indices_to_sample = self._align_tensor_and_indices(
+                    logits,
+                    num_indices,
+                    token_indices_to_sample,
+                    ori_token_indices_to_sample,
+                    is_logits=True,
+                )
+            draft_token_ids = logits.argmax(dim=-1)
+            assert draft_probs_steps is not None
+            draft_probs_steps.append(F.softmax(logits.float(), dim=-1))
+        elif get_ascend_config().enable_reduce_sample:
             if self.method in ("eagle3", "dflash", "mtp"):
                 draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
                 if lmhead_tp_enable():
@@ -1179,10 +1241,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
+            if draft_probs_steps is not None:
+                vocab_size = draft_probs_steps[0].shape[-1]
+                self.last_draft_probs = draft_probs_steps[0].view(
+                    -1, self.num_speculative_tokens, vocab_size
+                ).contiguous()
             # [batch_size, 1]
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.pcp_size > 1 and is_prefill:
+            if draft_probs_steps is not None:
+                self.last_draft_probs = draft_probs_steps[0].unsqueeze(1).expand(
+                    -1, self.num_speculative_tokens, -1
+                ).contiguous()
             draft_token_ids_list = []
             for _ in range(self.num_speculative_tokens):
                 draft_token_ids_list.append(draft_token_ids)
@@ -1301,7 +1372,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 )
 
             sample_hidden_states = last_hidden_states[token_indices_to_sample]
-            if get_ascend_config().enable_reduce_sample:
+            if self.collect_draft_probs:
+                logits = self.model.compute_logits(sample_hidden_states)
+                if lmhead_tp_enable() and num_indices < logits.shape[0]:
+                    logits = logits[:num_indices]
+                    token_indices_to_sample = token_indices_to_sample[:num_indices]
+                draft_token_ids = logits.argmax(dim=-1)
+                assert draft_probs_steps is not None
+                draft_probs_steps.append(F.softmax(logits.float(), dim=-1))
+            elif get_ascend_config().enable_reduce_sample:
                 if self.method in ("eagle3", "dflash", "mtp"):
                     draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
                     if lmhead_tp_enable() and num_indices < draft_token_ids.shape[0]:
@@ -1330,6 +1409,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
+        if draft_probs_steps is not None:
+            self.last_draft_probs = torch.stack(draft_probs_steps, dim=1).contiguous()
         return draft_token_ids
 
     def set_inputs_first_pass(

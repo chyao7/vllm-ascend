@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from contextvars import ContextVar, Token
 from dataclasses import replace
 
 import torch
@@ -20,7 +21,21 @@ from vllm.v1.sample.rejection_sampler import (
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_config import (
+    EAGLE_ACCEPTANCE_BETA_DEFAULT,
+    EAGLE_ACCEPTANCE_FALLBACK_MODE_ALPHA,
+    EAGLE_ACCEPTANCE_FALLBACK_MODE_ENTROPY_VERIFIED,
+    EAGLE_ACCEPTANCE_FALLBACK_MODE_LEGACY,
+    EAGLE_ACCEPTANCE_MODE_ALPHA,
+    EAGLE_ACCEPTANCE_MODE_DRAFT_PROBS,
+    EAGLE_ACCEPTANCE_MODE_ENTROPY_VERIFIED,
+    EAGLE_ACCEPTANCE_MODE_TARGET_MAX,
+    EAGLE_ACCEPTANCE_MODE_TARGET_MAX_FIRST_DRAFT_ROUNDS,
+    EAGLE_ACCEPTANCE_MODE_TARGET_MAX_INTERVAL_DRAFT_ROUNDS,
+    EAGLE_ACCEPTANCE_MODE_TARGET_MAX_PERIODIC,
+    EAGLE_ACCEPTANCE_TARGET_PROB_THRESHOLD_DEFAULT,
+    get_ascend_config,
+)
 from vllm_ascend.ops.triton.reject_sample import (
     cal_grid_and_block_size,
     expand_triton,
@@ -31,6 +46,73 @@ from vllm_ascend.ops.triton.reject_sample import (
 )
 from vllm_ascend.sample.penalties import apply_all_penalties
 from vllm_ascend.sample.sampler import apply_top_k_top_p
+
+_TARGET_MAX_REQUEST_MASK_CONTEXT: ContextVar[torch.Tensor | None] = ContextVar(
+    "target_max_request_mask_context",
+    default=None,
+)
+_SAVED_RAW_LOGITS_FOR_ENTROPY_CONTEXT: ContextVar[torch.Tensor | None] = (
+    ContextVar(
+        "saved_raw_logits_for_entropy_context",
+        default=None,
+    )
+)
+
+
+def set_target_max_request_mask_context(
+    mask: torch.Tensor | None,
+) -> Token[torch.Tensor | None]:
+    return _TARGET_MAX_REQUEST_MASK_CONTEXT.set(mask)
+
+
+def reset_target_max_request_mask_context(
+    token: Token[torch.Tensor | None],
+) -> None:
+    _TARGET_MAX_REQUEST_MASK_CONTEXT.reset(token)
+
+
+def _get_effective_eagle_acceptance_mode(eagle_acceptance_config):
+    if eagle_acceptance_config is None:
+        return None
+    if (
+        eagle_acceptance_config.eagle_acceptance_mode
+        == EAGLE_ACCEPTANCE_MODE_TARGET_MAX_PERIODIC
+    ):
+        return eagle_acceptance_config.eagle_acceptance_secondary_mode
+    return eagle_acceptance_config.eagle_acceptance_mode
+
+
+def _uses_periodic_target_max(eagle_acceptance_config) -> bool:
+    return (
+        eagle_acceptance_config is not None
+        and eagle_acceptance_config.eagle_acceptance_mode
+        == EAGLE_ACCEPTANCE_MODE_TARGET_MAX_PERIODIC
+    )
+
+
+def _get_eagle_acceptance_config():
+    try:
+        ascend_config = get_ascend_config()
+    except RuntimeError:
+        return None
+
+    vllm_config = getattr(ascend_config, "vllm_config", None)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    speculative_method = getattr(speculative_config, "method", None)
+    if speculative_method in ("eagle", "eagle3", "mtp"):
+        return ascend_config
+    return None
+
+
+def _disable_spec_decode_block_verify() -> bool:
+    try:
+        ascend_config = get_ascend_config()
+    except RuntimeError:
+        return False
+
+    return bool(
+        getattr(ascend_config, "disable_spec_decode_block_verify", False)
+    )
 
 
 class AscendRejectionSampler(RejectionSampler):
@@ -292,8 +374,29 @@ def apply_sampling_constraints(
     assert logits.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
     if sampling_metadata.all_greedy:
+        _SAVED_RAW_LOGITS_FOR_ENTROPY_CONTEXT.set(None)
         # return logits
         return logits, None
+
+    eagle_acceptance_config = _get_eagle_acceptance_config()
+    save_raw_logits = False
+    if eagle_acceptance_config is not None:
+        effective_mode = _get_effective_eagle_acceptance_mode(
+            eagle_acceptance_config
+        )
+        if effective_mode == EAGLE_ACCEPTANCE_MODE_ENTROPY_VERIFIED:
+            save_raw_logits = True
+        elif (
+            eagle_acceptance_config.eagle_acceptance_mode
+            == EAGLE_ACCEPTANCE_MODE_TARGET_MAX_FIRST_DRAFT_ROUNDS
+            and eagle_acceptance_config.eagle_acceptance_fallback_mode
+            == EAGLE_ACCEPTANCE_FALLBACK_MODE_ENTROPY_VERIFIED
+        ):
+            save_raw_logits = True
+    if save_raw_logits:
+        _SAVED_RAW_LOGITS_FOR_ENTROPY_CONTEXT.set(logits.clone())
+    else:
+        _SAVED_RAW_LOGITS_FOR_ENTROPY_CONTEXT.set(None)
 
     num_tokens = logits.shape[0]
     temperature = expand_batch_to_tokens(
@@ -396,11 +499,204 @@ def rejection_sample(
     assert bonus_token_ids.is_contiguous()
     assert target_logits.shape[0] == num_tokens
 
+    ascend_config = get_ascend_config()
+    eagle_acceptance_config = _get_eagle_acceptance_config()
+    is_hybrid_mode = False
+    fallback_mode = EAGLE_ACCEPTANCE_FALLBACK_MODE_LEGACY
+    if eagle_acceptance_config is not None and (
+        eagle_acceptance_config.eagle_acceptance_mode
+        == EAGLE_ACCEPTANCE_MODE_TARGET_MAX_FIRST_DRAFT_ROUNDS
+    ):
+        fallback_mode = eagle_acceptance_config.eagle_acceptance_fallback_mode
+        is_hybrid_mode = fallback_mode != EAGLE_ACCEPTANCE_FALLBACK_MODE_LEGACY
+
+    no_draft_probs_acceptance_config = (
+        eagle_acceptance_config if draft_probs is None else None
+    )
+    draft_probs_acceptance_config = (
+        eagle_acceptance_config if draft_probs is not None else None
+    )
+    uses_periodic_target_max = _uses_periodic_target_max(
+        eagle_acceptance_config
+    )
+    use_target_max_no_draft_probs_acceptance = (
+        no_draft_probs_acceptance_config is not None
+        and no_draft_probs_acceptance_config.eagle_acceptance_mode
+        == EAGLE_ACCEPTANCE_MODE_TARGET_MAX
+    )
+    use_alpha_no_draft_probs_acceptance = (
+        no_draft_probs_acceptance_config is not None
+        and no_draft_probs_acceptance_config.eagle_acceptance_mode
+        == EAGLE_ACCEPTANCE_MODE_ALPHA
+    )
+    use_target_max_request_mask_no_draft_probs_acceptance = (
+        uses_periodic_target_max
+        or (
+            no_draft_probs_acceptance_config is not None
+            and no_draft_probs_acceptance_config.eagle_acceptance_mode
+            in (
+                EAGLE_ACCEPTANCE_MODE_TARGET_MAX_FIRST_DRAFT_ROUNDS,
+                EAGLE_ACCEPTANCE_MODE_TARGET_MAX_INTERVAL_DRAFT_ROUNDS,
+            )
+        )
+    )
+    use_draft_probs_alpha_acceptance = (
+        draft_probs_acceptance_config is not None
+        and draft_probs_acceptance_config.eagle_acceptance_mode
+        == EAGLE_ACCEPTANCE_MODE_DRAFT_PROBS
+    )
+    use_entropy_verified_acceptance = (
+        eagle_acceptance_config is not None
+        and eagle_acceptance_config.eagle_acceptance_mode
+        == EAGLE_ACCEPTANCE_MODE_ENTROPY_VERIFIED
+    )
+    if (
+        eagle_acceptance_config is not None
+        and uses_periodic_target_max
+        and _get_effective_eagle_acceptance_mode(eagle_acceptance_config)
+        == EAGLE_ACCEPTANCE_MODE_ENTROPY_VERIFIED
+    ):
+        use_entropy_verified_acceptance = True
+    use_hybrid_target_max_mask = is_hybrid_mode
+    use_hybrid_alpha_fallback = (
+        is_hybrid_mode and fallback_mode == EAGLE_ACCEPTANCE_FALLBACK_MODE_ALPHA
+    )
+    use_hybrid_entropy_fallback = (
+        is_hybrid_mode
+        and fallback_mode == EAGLE_ACCEPTANCE_FALLBACK_MODE_ENTROPY_VERIFIED
+    )
+    if use_hybrid_entropy_fallback:
+        use_entropy_verified_acceptance = True
+
+    if use_target_max_no_draft_probs_acceptance:
+        eagle3_acceptance_alpha = 1.0
+        adjust_eagle3_acceptance = False
+        no_draft_probs_target_prob_threshold = (
+            no_draft_probs_acceptance_config.eagle_acceptance_target_prob_threshold
+        )
+        no_draft_probs_acceptance_beta = (
+            no_draft_probs_acceptance_config.eagle_acceptance_beta
+        )
+    elif uses_periodic_target_max:
+        eagle3_acceptance_alpha = 1.0
+        adjust_eagle3_acceptance = False
+        effective_mode = _get_effective_eagle_acceptance_mode(
+            eagle_acceptance_config
+        )
+        if effective_mode in (
+            EAGLE_ACCEPTANCE_MODE_ALPHA,
+            EAGLE_ACCEPTANCE_MODE_DRAFT_PROBS,
+        ):
+            eagle3_acceptance_alpha = (
+                eagle_acceptance_config.eagle_acceptance_secondary_alpha
+            )
+            adjust_eagle3_acceptance = eagle3_acceptance_alpha != 1.0
+        no_draft_probs_target_prob_threshold = (
+            eagle_acceptance_config.eagle_acceptance_target_prob_threshold
+        )
+        no_draft_probs_acceptance_beta = (
+            eagle_acceptance_config.eagle_acceptance_beta
+        )
+    elif is_hybrid_mode:
+        eagle3_acceptance_alpha = 1.0
+        adjust_eagle3_acceptance = False
+        no_draft_probs_target_prob_threshold = (
+            eagle_acceptance_config.eagle_acceptance_target_prob_threshold
+        )
+        no_draft_probs_acceptance_beta = (
+            eagle_acceptance_config.eagle_acceptance_beta
+        )
+        if use_hybrid_alpha_fallback:
+            eagle3_acceptance_alpha = (
+                eagle_acceptance_config.eagle_acceptance_alpha
+            )
+            adjust_eagle3_acceptance = eagle3_acceptance_alpha != 1.0
+    elif use_target_max_request_mask_no_draft_probs_acceptance:
+        eagle3_acceptance_alpha = 1.0
+        adjust_eagle3_acceptance = False
+        no_draft_probs_target_prob_threshold = (
+            no_draft_probs_acceptance_config.eagle_acceptance_target_prob_threshold
+        )
+        no_draft_probs_acceptance_beta = (
+            no_draft_probs_acceptance_config.eagle_acceptance_beta
+        )
+    elif use_alpha_no_draft_probs_acceptance:
+        eagle3_acceptance_alpha = (
+            no_draft_probs_acceptance_config.eagle_acceptance_alpha
+        )
+        adjust_eagle3_acceptance = eagle3_acceptance_alpha != 1.0
+        no_draft_probs_target_prob_threshold = 0.0
+        no_draft_probs_acceptance_beta = 1.0
+    elif use_draft_probs_alpha_acceptance:
+        eagle3_acceptance_alpha = (
+            draft_probs_acceptance_config.eagle_acceptance_alpha
+        )
+        adjust_eagle3_acceptance = eagle3_acceptance_alpha != 1.0
+        no_draft_probs_target_prob_threshold = 0.0
+        no_draft_probs_acceptance_beta = 1.0
+    else:
+        eagle3_acceptance_alpha = 1.0
+        adjust_eagle3_acceptance = False
+        no_draft_probs_target_prob_threshold = 0.0
+        no_draft_probs_acceptance_beta = 1.0
+
+    using_entropy_verify = bool(
+        ascend_config.rejection_sampler_config.enable_entropy_verify
+    ) or use_entropy_verified_acceptance
+    if use_entropy_verified_acceptance:
+        if uses_periodic_target_max:
+            posterior_threshold = (
+                eagle_acceptance_config.eagle_acceptance_secondary_posterior_threshold
+            )
+            posterior_alpha = (
+                eagle_acceptance_config.eagle_acceptance_secondary_posterior_alpha
+            )
+        else:
+            posterior_threshold = (
+                eagle_acceptance_config.eagle_acceptance_posterior_threshold
+            )
+            posterior_alpha = (
+                eagle_acceptance_config.eagle_acceptance_posterior_alpha
+            )
+    else:
+        posterior_threshold = float(
+            ascend_config.rejection_sampler_config.posterior_threshold
+        )
+        posterior_alpha = float(
+            ascend_config.rejection_sampler_config.posterior_alpha
+        )
+
+    if (
+        use_target_max_request_mask_no_draft_probs_acceptance
+        or use_hybrid_target_max_mask
+    ):
+        target_max_request_mask = _TARGET_MAX_REQUEST_MASK_CONTEXT.get()
+        if target_max_request_mask is None:
+            target_max_request_mask = torch.zeros(
+                (batch_size,),
+                dtype=torch.bool,
+                device=device,
+            )
+        else:
+            target_max_request_mask = target_max_request_mask.to(
+                device=device,
+                dtype=torch.bool,
+                non_blocking=True,
+            )
+    else:
+        target_max_request_mask = target_logits.new_empty(
+            (batch_size,),
+            dtype=torch.bool,
+        )
+
     # Block verify requires enable_block_verify config and max_spec_len >= 3.
-    using_block_verify = max_spec_len >= 3 and bool(get_ascend_config().rejection_sampler_config.enable_block_verify)
-    using_entropy_verify = bool(get_ascend_config().rejection_sampler_config.enable_entropy_verify)
-    posterior_threshold = float(get_ascend_config().rejection_sampler_config.posterior_threshold)
-    posterior_alpha = float(get_ascend_config().rejection_sampler_config.posterior_alpha)
+    using_block_verify = (
+        max_spec_len >= 3
+        and draft_probs is not None
+        and bool(ascend_config.rejection_sampler_config.enable_block_verify)
+        and not _disable_spec_decode_block_verify()
+        and not is_hybrid_mode
+    )
     logger.debug_once(
         "[sample/rejection_sampler] Rejection sampling path: "
         "block_verify=%s, entropy_verify=%s, all_greedy=%s, all_random=%s, "
@@ -413,10 +709,16 @@ def rejection_sample(
         HAS_TRITON,
     )
 
-    if using_entropy_verify and ori_target_logits is not None:
+    saved_raw_logits_for_entropy = _SAVED_RAW_LOGITS_FOR_ENTROPY_CONTEXT.get()
+    if use_entropy_verified_acceptance and saved_raw_logits_for_entropy is not None:
+        ori_target_probs = saved_raw_logits_for_entropy.softmax(
+            dim=-1, dtype=torch.float32
+        ).contiguous()
+    elif using_entropy_verify and ori_target_logits is not None:
         ori_target_probs = ori_target_logits.softmax(dim=-1, dtype=torch.float32)
     else:
         ori_target_probs = None
+    _SAVED_RAW_LOGITS_FOR_ENTROPY_CONTEXT.set(None)
 
     # Create output buffer.
     output_token_ids = torch.empty(
@@ -501,6 +803,14 @@ def rejection_sample(
         # Compute probability distribution from target logits
         target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
         assert target_probs.is_contiguous()
+        if (
+            use_target_max_no_draft_probs_acceptance
+            or use_target_max_request_mask_no_draft_probs_acceptance
+            or use_hybrid_target_max_mask
+        ):
+            target_max_probs = target_probs.max(dim=-1).values.contiguous()
+        else:
+            target_max_probs = target_probs.new_empty((num_tokens,))
 
         # Generate uniform probabilities for rejection sampling
         uniform_probs = generate_uniform_probs(
@@ -511,6 +821,11 @@ def rejection_sample(
         )
 
         # Sample recovered tokens for each position
+        triton_draft_probs = draft_probs if draft_probs is not None else target_probs
+        triton_ori_target_probs = (
+            ori_target_probs if ori_target_probs is not None else target_probs
+        )
+        triton_target_indices = draft_token_ids
         recovered_token_ids = sample_recovered_tokens(
             max_spec_len,
             num_draft_tokens,
@@ -523,6 +838,11 @@ def rejection_sample(
             target_indices=target_indices,
             global_vocab_size=global_vocab_size,
             enable_reduce_sampling=True,
+            target_max_request_mask=target_max_request_mask,
+            use_target_max_request_mask_for_no_draft_probs=(
+                use_target_max_request_mask_no_draft_probs_acceptance
+                or use_hybrid_target_max_mask
+            ),
         )
 
         if not using_block_verify:
@@ -532,9 +852,11 @@ def rejection_sample(
                     output_token_ids,
                     cu_num_draft_tokens,
                     draft_token_ids,
-                    draft_probs,
+                    triton_draft_probs,
                     target_probs,
                     target_indices,
+                    target_max_probs,
+                    target_max_request_mask,
                     bonus_token_ids,
                     recovered_token_ids,
                     uniform_probs.to(torch.float32),
@@ -543,10 +865,21 @@ def rejection_sample(
                     selected_vocab_size,
                     global_vocab_size,
                     batch_size,
-                    ori_target_probs,
+                    triton_ori_target_probs,
+                    no_draft_probs_target_prob_threshold,
+                    no_draft_probs_acceptance_beta,
+                    eagle3_acceptance_alpha,
                     NO_ORI_TARGET_PROBS=ori_target_probs is None,
                     NO_DRAFT_PROBS=draft_probs is None,
                     ENABLE_REDUCE_SAMPLING=True,
+                    USE_TARGET_MAX_FOR_NO_DRAFT_PROBS=(
+                        use_target_max_no_draft_probs_acceptance
+                    ),
+                    USE_TARGET_MAX_REQUEST_MASK_FOR_NO_DRAFT_PROBS=(
+                        use_target_max_request_mask_no_draft_probs_acceptance
+                        or use_hybrid_target_max_mask
+                    ),
+                    ADJUST_EAGLE3_ACCEPTANCE=adjust_eagle3_acceptance,
                     ENTROPY_VERIFY=using_entropy_verify,
                     BLOCK_SIZE=block_size,
                     POSTERIOR_THRESHOLD=posterior_threshold,
@@ -570,11 +903,23 @@ def rejection_sample(
                     IS_NGRAM=draft_probs is None,
                     target_indices=target_indices,
                     enable_reduce_sampling=True,
+                    entropy_probs=ori_target_probs,
+                    target_max_probs=target_max_probs,
+                    target_max_request_mask=target_max_request_mask,
+                    no_draft_probs_target_prob_threshold=no_draft_probs_target_prob_threshold,
+                    no_draft_probs_acceptance_beta=no_draft_probs_acceptance_beta,
+                    eagle3_acceptance_alpha=eagle3_acceptance_alpha,
+                    adjust_eagle3_acceptance=adjust_eagle3_acceptance,
                     ENTROPY_VERIFY=using_entropy_verify,
                     POSTERIOR_THRESHOLD=posterior_threshold,
                     POSTERIOR_ALPHA=posterior_alpha,
                     EPSILON=1e-10,
                     ori_target_probs=ori_target_probs,
+                    use_target_max_for_no_draft_probs=use_target_max_no_draft_probs_acceptance,
+                    use_target_max_request_mask_for_no_draft_probs=(
+                        use_target_max_request_mask_no_draft_probs_acceptance
+                        or use_hybrid_target_max_mask
+                    ),
                 )
         else:
             # MagicMTP: Improving acceptance rate with Block Verify.
@@ -584,9 +929,11 @@ def rejection_sample(
                     output_token_ids,
                     cu_num_draft_tokens,
                     draft_token_ids,
-                    draft_probs,
+                    triton_draft_probs,
                     target_probs,
                     target_indices,
+                    target_max_probs,
+                    target_max_request_mask,
                     bonus_token_ids,
                     recovered_token_ids,
                     uniform_probs.to(torch.float32),
@@ -595,10 +942,21 @@ def rejection_sample(
                     selected_vocab_size,
                     global_vocab_size,
                     batch_size,
-                    ori_target_probs,
+                    triton_ori_target_probs,
+                    no_draft_probs_target_prob_threshold,
+                    no_draft_probs_acceptance_beta,
+                    eagle3_acceptance_alpha,
                     NO_ORI_TARGET_PROBS=ori_target_probs is None,
                     NO_DRAFT_PROBS=draft_probs is None,
                     ENABLE_REDUCE_SAMPLING=True,
+                    USE_TARGET_MAX_FOR_NO_DRAFT_PROBS=(
+                        use_target_max_no_draft_probs_acceptance
+                    ),
+                    USE_TARGET_MAX_REQUEST_MASK_FOR_NO_DRAFT_PROBS=(
+                        use_target_max_request_mask_no_draft_probs_acceptance
+                        or use_hybrid_target_max_mask
+                    ),
+                    ADJUST_EAGLE3_ACCEPTANCE=adjust_eagle3_acceptance,
                     ENTROPY_VERIFY=using_entropy_verify,
                     BLOCK_SIZE=block_size,
                     POSTERIOR_THRESHOLD=posterior_threshold,
@@ -622,11 +980,23 @@ def rejection_sample(
                     IS_NGRAM=draft_probs is None,
                     target_indices=target_indices,
                     enable_reduce_sampling=True,
+                    entropy_probs=ori_target_probs,
+                    target_max_probs=target_max_probs,
+                    target_max_request_mask=target_max_request_mask,
+                    no_draft_probs_target_prob_threshold=no_draft_probs_target_prob_threshold,
+                    no_draft_probs_acceptance_beta=no_draft_probs_acceptance_beta,
+                    eagle3_acceptance_alpha=eagle3_acceptance_alpha,
+                    adjust_eagle3_acceptance=adjust_eagle3_acceptance,
                     ENTROPY_VERIFY=using_entropy_verify,
                     POSTERIOR_THRESHOLD=posterior_threshold,
                     POSTERIOR_ALPHA=posterior_alpha,
                     EPSILON=1e-10,
                     ori_target_probs=ori_target_probs,
+                    use_target_max_for_no_draft_probs=use_target_max_no_draft_probs_acceptance,
+                    use_target_max_request_mask_for_no_draft_probs=(
+                        use_target_max_request_mask_no_draft_probs_acceptance
+                        or use_hybrid_target_max_mask
+                    ),
                 )
     else:
         # Fallback to original mode
@@ -644,6 +1014,14 @@ def rejection_sample(
         # Compute probability distribution from target logits
         target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
         assert target_probs.is_contiguous()
+        if (
+            use_target_max_no_draft_probs_acceptance
+            or use_target_max_request_mask_no_draft_probs_acceptance
+            or use_hybrid_target_max_mask
+        ):
+            target_max_probs = target_probs.max(dim=-1).values.contiguous()
+        else:
+            target_max_probs = target_probs.new_empty((num_tokens,))
 
         # Generate uniform probabilities for rejection sampling
         uniform_probs = generate_uniform_probs(
@@ -654,6 +1032,11 @@ def rejection_sample(
         )
 
         # Sample recovered tokens for each position
+        triton_draft_probs = draft_probs if draft_probs is not None else target_probs
+        triton_ori_target_probs = (
+            ori_target_probs if ori_target_probs is not None else target_probs
+        )
+        triton_target_indices = draft_token_ids
         recovered_token_ids = sample_recovered_tokens(
             max_spec_len,
             num_draft_tokens,
@@ -666,6 +1049,11 @@ def rejection_sample(
             target_indices=None,
             global_vocab_size=vocab_size,
             enable_reduce_sampling=False,
+            target_max_request_mask=target_max_request_mask,
+            use_target_max_request_mask_for_no_draft_probs=(
+                use_target_max_request_mask_no_draft_probs_acceptance
+                or use_hybrid_target_max_mask
+            ),
         )
 
         if not using_block_verify:
@@ -674,9 +1062,11 @@ def rejection_sample(
                     output_token_ids,
                     cu_num_draft_tokens,
                     draft_token_ids,
-                    draft_probs,
+                    triton_draft_probs,
                     target_probs,
-                    None,  # target_indices
+                    triton_target_indices,
+                    target_max_probs,
+                    target_max_request_mask,
                     bonus_token_ids,
                     recovered_token_ids,
                     uniform_probs.to(torch.float32),
@@ -685,10 +1075,21 @@ def rejection_sample(
                     vocab_size,
                     global_vocab_size,  # global_vocab_size
                     batch_size,
-                    ori_target_probs,
+                    triton_ori_target_probs,
+                    no_draft_probs_target_prob_threshold,
+                    no_draft_probs_acceptance_beta,
+                    eagle3_acceptance_alpha,
                     NO_ORI_TARGET_PROBS=ori_target_probs is None,
                     NO_DRAFT_PROBS=draft_probs is None,
                     ENABLE_REDUCE_SAMPLING=False,
+                    USE_TARGET_MAX_FOR_NO_DRAFT_PROBS=(
+                        use_target_max_no_draft_probs_acceptance
+                    ),
+                    USE_TARGET_MAX_REQUEST_MASK_FOR_NO_DRAFT_PROBS=(
+                        use_target_max_request_mask_no_draft_probs_acceptance
+                        or use_hybrid_target_max_mask
+                    ),
+                    ADJUST_EAGLE3_ACCEPTANCE=adjust_eagle3_acceptance,
                     ENTROPY_VERIFY=using_entropy_verify,
                     BLOCK_SIZE=block_size,
                     POSTERIOR_THRESHOLD=posterior_threshold,
@@ -712,11 +1113,23 @@ def rejection_sample(
                     IS_NGRAM=draft_probs is None,
                     target_indices=None,
                     enable_reduce_sampling=False,
+                    entropy_probs=ori_target_probs,
+                    target_max_probs=target_max_probs,
+                    target_max_request_mask=target_max_request_mask,
+                    no_draft_probs_target_prob_threshold=no_draft_probs_target_prob_threshold,
+                    no_draft_probs_acceptance_beta=no_draft_probs_acceptance_beta,
+                    eagle3_acceptance_alpha=eagle3_acceptance_alpha,
+                    adjust_eagle3_acceptance=adjust_eagle3_acceptance,
                     ENTROPY_VERIFY=using_entropy_verify,
                     POSTERIOR_THRESHOLD=posterior_threshold,
                     POSTERIOR_ALPHA=posterior_alpha,
                     EPSILON=1e-10,
                     ori_target_probs=ori_target_probs,
+                    use_target_max_for_no_draft_probs=use_target_max_no_draft_probs_acceptance,
+                    use_target_max_request_mask_for_no_draft_probs=(
+                        use_target_max_request_mask_no_draft_probs_acceptance
+                        or use_hybrid_target_max_mask
+                    ),
                 )
         else:
             if HAS_TRITON:
@@ -724,9 +1137,11 @@ def rejection_sample(
                     output_token_ids,
                     cu_num_draft_tokens,
                     draft_token_ids,
-                    draft_probs,
+                    triton_draft_probs,
                     target_probs,
-                    None,  # target_indices
+                    triton_target_indices,
+                    target_max_probs,
+                    target_max_request_mask,
                     bonus_token_ids,
                     recovered_token_ids,
                     uniform_probs.to(torch.float32),
@@ -735,10 +1150,21 @@ def rejection_sample(
                     vocab_size,
                     global_vocab_size,  # global_vocab_size
                     batch_size,
-                    ori_target_probs,
+                    triton_ori_target_probs,
+                    no_draft_probs_target_prob_threshold,
+                    no_draft_probs_acceptance_beta,
+                    eagle3_acceptance_alpha,
                     NO_ORI_TARGET_PROBS=ori_target_probs is None,
                     NO_DRAFT_PROBS=draft_probs is None,
                     ENABLE_REDUCE_SAMPLING=False,
+                    USE_TARGET_MAX_FOR_NO_DRAFT_PROBS=(
+                        use_target_max_no_draft_probs_acceptance
+                    ),
+                    USE_TARGET_MAX_REQUEST_MASK_FOR_NO_DRAFT_PROBS=(
+                        use_target_max_request_mask_no_draft_probs_acceptance
+                        or use_hybrid_target_max_mask
+                    ),
+                    ADJUST_EAGLE3_ACCEPTANCE=adjust_eagle3_acceptance,
                     ENTROPY_VERIFY=using_entropy_verify,
                     BLOCK_SIZE=block_size,
                     POSTERIOR_THRESHOLD=posterior_threshold,
@@ -762,11 +1188,23 @@ def rejection_sample(
                     IS_NGRAM=draft_probs is None,
                     target_indices=None,
                     enable_reduce_sampling=False,
+                    entropy_probs=ori_target_probs,
+                    target_max_probs=target_max_probs,
+                    target_max_request_mask=target_max_request_mask,
+                    no_draft_probs_target_prob_threshold=no_draft_probs_target_prob_threshold,
+                    no_draft_probs_acceptance_beta=no_draft_probs_acceptance_beta,
+                    eagle3_acceptance_alpha=eagle3_acceptance_alpha,
+                    adjust_eagle3_acceptance=adjust_eagle3_acceptance,
                     ENTROPY_VERIFY=using_entropy_verify,
                     POSTERIOR_THRESHOLD=posterior_threshold,
                     POSTERIOR_ALPHA=posterior_alpha,
                     EPSILON=1e-10,
                     ori_target_probs=ori_target_probs,
+                    use_target_max_for_no_draft_probs=use_target_max_no_draft_probs_acceptance,
+                    use_target_max_request_mask_for_no_draft_probs=(
+                        use_target_max_request_mask_no_draft_probs_acceptance
+                        or use_hybrid_target_max_mask
+                    ),
                 )
 
     return output_token_ids
@@ -828,6 +1266,8 @@ def sample_recovered_tokens(
     target_indices: torch.Tensor | None = None,
     global_vocab_size: int | None = None,
     enable_reduce_sampling: bool = False,
+    target_max_request_mask: torch.Tensor | None = None,
+    use_target_max_request_mask_for_no_draft_probs: bool = False,
 ) -> torch.Tensor:
     batch_size = len(num_draft_tokens)
     vocab_size = target_probs.shape[-1]
@@ -849,18 +1289,26 @@ def sample_recovered_tokens(
 
     recovered_token_ids = torch.empty_like(draft_token_ids)
     if HAS_TRITON:
+        triton_draft_probs = draft_probs if draft_probs is not None else target_probs
+        triton_target_indices = (
+            target_indices if target_indices is not None else draft_token_ids
+        )
         sample_recovered_tokens_kernel[(batch_size, max_spec_len)](
             recovered_token_ids,
             cu_num_draft_tokens,
             draft_token_ids,
-            draft_probs,
+            triton_draft_probs,
             target_probs,
-            target_indices,  # None for normal mode
+            triton_target_indices,
             q,
+            target_max_request_mask,
             vocab_size,
             global_vocab_size if global_vocab_size is not None else vocab_size,
             NO_DRAFT_PROBS=draft_probs is None,
             ENABLE_REDUCE_SAMPLING=enable_reduce_sampling,
+            USE_TARGET_MAX_REQUEST_MASK_FOR_NO_DRAFT_PROBS=(
+                use_target_max_request_mask_for_no_draft_probs
+            ),
             VOCAB_BLOCK_SIZE=512,
             SUB_BLOCK=4 * 1024,
             # TODO: enable multibuffer when accuracy problem is solved.
@@ -878,6 +1326,10 @@ def sample_recovered_tokens(
             IS_NGRAM=draft_probs is None,
             target_indices=target_indices,
             enable_reduce_sampling=enable_reduce_sampling,
+            target_max_request_mask=target_max_request_mask,
+            use_target_max_request_mask_for_no_draft_probs=(
+                use_target_max_request_mask_for_no_draft_probs
+            ),
         )
     else:
         sample_recovered_tokens_pytorch(
@@ -891,6 +1343,10 @@ def sample_recovered_tokens(
             IS_NGRAM=draft_probs is None,
             target_indices=target_indices,
             enable_reduce_sampling=enable_reduce_sampling,
+            target_max_request_mask=target_max_request_mask,
+            use_target_max_request_mask_for_no_draft_probs=(
+                use_target_max_request_mask_for_no_draft_probs
+            ),
         )
     return recovered_token_ids
 
@@ -979,11 +1435,22 @@ def rejection_random_sample_pytorch(
     IS_NGRAM=False,
     target_indices=None,  # [num_tokens, selected_vocab_size] global vocab indices
     enable_reduce_sampling=False,
+    entropy_probs=None,
+    target_max_probs=None,
+    target_max_request_mask=None,
+    no_draft_probs_target_prob_threshold: float = (
+        EAGLE_ACCEPTANCE_TARGET_PROB_THRESHOLD_DEFAULT
+    ),
+    no_draft_probs_acceptance_beta: float = EAGLE_ACCEPTANCE_BETA_DEFAULT,
+    eagle3_acceptance_alpha: float = 1.0,
+    adjust_eagle3_acceptance: bool = False,
     ENTROPY_VERIFY=False,
     POSTERIOR_THRESHOLD=0.95,
     POSTERIOR_ALPHA=0.4,
     EPSILON=1e-10,
     ori_target_probs=None,
+    use_target_max_for_no_draft_probs: bool = False,
+    use_target_max_request_mask_for_no_draft_probs: bool = False,
 ):
     """
     This function implements the Speculative Decoding rejection sampling step.
@@ -1028,8 +1495,49 @@ def rejection_random_sample_pytorch(
     draft_tokens = draft_token_ids[global_token_indices]  # [batch_size, max_draft_len]
     placeholder_mask = draft_tokens == PLACEHOLDER_TOKEN_ID
     safe_draft_tokens = draft_tokens.masked_fill(placeholder_mask, 0)
+    use_any_target_max_for_no_draft_probs = (
+        use_target_max_for_no_draft_probs
+        or use_target_max_request_mask_for_no_draft_probs
+    )
+    if use_target_max_request_mask_for_no_draft_probs:
+        if target_max_request_mask is None:
+            target_max_request_mask = torch.zeros(
+                (batch_size,),
+                dtype=torch.bool,
+                device=device,
+            )
+        target_max_request_mask = target_max_request_mask.to(
+            device=device,
+            dtype=torch.bool,
+            non_blocking=True,
+        )
+        target_max_acceptance_mask = target_max_request_mask[:, None]
+    else:
+        target_max_acceptance_mask = None
 
-    if IS_NGRAM:
+    if use_any_target_max_for_no_draft_probs:
+        if target_max_probs is None:
+            target_max_probs = target_probs.max(dim=-1).values
+        target_max_token_probs = target_max_probs[global_token_indices]
+        if use_target_max_request_mask_for_no_draft_probs:
+            if IS_NGRAM:
+                ones_cpu = torch.ones(1, pin_memory=True, dtype=torch.float32)
+                fallback_token_probs = ones_cpu.to(device, non_blocking=True).expand_as(
+                    draft_tokens
+                )
+            else:
+                flat_indices = global_token_indices.flatten()
+                flat_draft_tokens = safe_draft_tokens.flatten()
+                flat_draft_probs = draft_probs[flat_indices, flat_draft_tokens]
+                fallback_token_probs = flat_draft_probs.view(batch_size, max_draft_len)
+            draft_token_probs = torch.where(
+                target_max_acceptance_mask,
+                target_max_token_probs,
+                fallback_token_probs,
+            )
+        else:
+            draft_token_probs = target_max_token_probs
+    elif IS_NGRAM:
         ones_cpu = torch.ones(1, pin_memory=True, dtype=torch.float32)
         draft_token_probs = ones_cpu.to(device, non_blocking=True).expand_as(draft_tokens)
     else:
@@ -1064,25 +1572,70 @@ def rejection_random_sample_pytorch(
         target_token_probs = flat_target_probs.view(batch_size, max_draft_len)
 
     uniform_token_probs = uniform_probs[global_token_indices]
+    if adjust_eagle3_acceptance:
+        adjusted_uniform_probs = uniform_token_probs / eagle3_acceptance_alpha
+        if (
+            use_target_max_request_mask_for_no_draft_probs
+            and target_max_acceptance_mask is not None
+        ):
+            uniform_token_probs = torch.where(
+                target_max_acceptance_mask,
+                uniform_token_probs,
+                adjusted_uniform_probs,
+            )
+        else:
+            uniform_token_probs = adjusted_uniform_probs
     recovered_tokens = recovered_token_ids[global_token_indices]
 
     zero_threshold_cpu = torch.tensor([0.0], pin_memory=True, dtype=torch.float32)
     zero_threshold = zero_threshold_cpu.to(device, non_blocking=True)
 
+    acceptance_scores = target_token_probs / draft_token_probs
+    if use_target_max_for_no_draft_probs:
+        acceptance_scores = acceptance_scores * no_draft_probs_acceptance_beta
+    elif use_target_max_request_mask_for_no_draft_probs:
+        acceptance_scores = torch.where(
+            target_max_acceptance_mask,
+            acceptance_scores * no_draft_probs_acceptance_beta,
+            acceptance_scores,
+        )
+
     if ENTROPY_VERIFY:
-        entropy_probs = ori_target_probs if ori_target_probs is not None else target_probs
+        entropy_probs = (
+            entropy_probs
+            if entropy_probs is not None
+            else (ori_target_probs if ori_target_probs is not None else target_probs)
+        )
         all_target_dist = entropy_probs[global_token_indices]
         entropy = -(all_target_dist * torch.log(all_target_dist + EPSILON)).sum(dim=-1)
         exp_neg_entropy = torch.exp(-entropy * POSTERIOR_ALPHA)
         posterior_threshold_device = torch.tensor(POSTERIOR_THRESHOLD, device=device, dtype=torch.float32)
         threshold = torch.minimum(exp_neg_entropy, posterior_threshold_device)
-        modified_uniform_token_probs = threshold * uniform_token_probs
-        acceptance_condition = (draft_token_probs > zero_threshold) & (
-            target_token_probs / draft_token_probs >= modified_uniform_token_probs
+        entropy_uniform_token_probs = threshold * uniform_token_probs
+        if (
+            use_target_max_request_mask_for_no_draft_probs
+            and target_max_acceptance_mask is not None
+        ):
+            uniform_token_probs = torch.where(
+                target_max_acceptance_mask,
+                uniform_token_probs,
+                entropy_uniform_token_probs,
+            )
+        else:
+            uniform_token_probs = entropy_uniform_token_probs
+    acceptance_condition = (draft_token_probs > zero_threshold) & (
+        acceptance_scores >= uniform_token_probs
+    )
+    if use_target_max_for_no_draft_probs:
+        acceptance_condition = acceptance_condition & (
+            target_token_probs >= no_draft_probs_target_prob_threshold
         )
-    else:
-        acceptance_condition = (draft_token_probs > zero_threshold) & (
-            target_token_probs / draft_token_probs >= uniform_token_probs
+    elif use_target_max_request_mask_for_no_draft_probs:
+        threshold_condition = target_token_probs >= no_draft_probs_target_prob_threshold
+        acceptance_condition = acceptance_condition & torch.where(
+            target_max_acceptance_mask,
+            threshold_condition,
+            torch.ones_like(threshold_condition, dtype=torch.bool),
         )
     acceptance_condition = acceptance_condition & (~placeholder_mask)
 
@@ -1195,6 +1748,8 @@ def sample_recovered_tokens_pytorch(
     IS_NGRAM=False,
     target_indices=None,  # [num_tokens, selected_vocab_size] global vocab indices
     enable_reduce_sampling=False,
+    target_max_request_mask=None,
+    use_target_max_request_mask_for_no_draft_probs: bool = False,
 ):
     """
     When a draft token is rejected, we must sample a "recovered" token from
@@ -1241,10 +1796,25 @@ def sample_recovered_tokens_pytorch(
     has_match = in_range_mask.any(dim=1)
     token_to_batch = torch.where(has_match, token_to_batch, 0)
 
+    use_target_max_recovery_mask = None
+    if use_target_max_request_mask_for_no_draft_probs:
+        if target_max_request_mask is None:
+            target_max_request_mask = torch.zeros(
+                (cu_num_draft_tokens.shape[0],),
+                dtype=torch.bool,
+                device=device,
+            )
+        target_max_request_mask = target_max_request_mask.to(
+            device=device,
+            dtype=torch.bool,
+            non_blocking=True,
+        )
+        use_target_max_recovery_mask = target_max_request_mask[token_to_batch]
+
     if enable_reduce_sampling:
         # enable reduce_sampling: target_probs is [num_tokens, selected_vocab_size]
         # target_indices maps compressed indices to global vocab indices
-        if IS_NGRAM:
+        if IS_NGRAM or use_target_max_request_mask_for_no_draft_probs:
             # Zero out the draft token in target_probs
             prob = target_probs.clone()
             for i in range(num_tokens):
@@ -1252,6 +1822,27 @@ def sample_recovered_tokens_pytorch(
                 if draft_id != PLACEHOLDER_TOKEN_ID:
                     mask = target_indices[i] == draft_id
                     prob[i, mask] = 0
+            if not IS_NGRAM:
+                flat_indices = target_indices.flatten()
+                token_offsets = torch.arange(num_tokens, device=device)[:, None] * draft_probs.shape[1]
+                flat_token_offsets = token_offsets.expand_as(target_indices).flatten()
+
+                draft_probs_flat = draft_probs.flatten()
+                valid_mask = flat_indices < draft_probs.shape[1]
+                flat_draft_probs_at_indices = torch.where(
+                    valid_mask, draft_probs_flat[flat_token_offsets + flat_indices], torch.tensor(0.0, device=device)
+                )
+                draft_probs_at_indices = flat_draft_probs_at_indices.view(num_tokens, vocab_size)
+
+                draft_prob = torch.maximum(
+                    target_probs - draft_probs_at_indices,
+                    torch.tensor(0.0, device=device),
+                )
+                prob = torch.where(
+                    use_target_max_recovery_mask[:, None],
+                    prob,
+                    draft_prob,
+                )
         else:
             # Gather draft probs at candidate indices
             flat_indices = target_indices.flatten()
@@ -1271,7 +1862,7 @@ def sample_recovered_tokens_pytorch(
             )
     else:
         # normal mode
-        if IS_NGRAM:
+        if IS_NGRAM or use_target_max_request_mask_for_no_draft_probs:
             token_indices = torch.arange(num_tokens, device=device)
 
             modified_target_probs = target_probs.clone()
@@ -1280,7 +1871,18 @@ def sample_recovered_tokens_pytorch(
                 token_indices[valid_draft_mask],
                 draft_token_ids[valid_draft_mask],
             ] = 0
-            prob = modified_target_probs
+            if IS_NGRAM:
+                prob = modified_target_probs
+            else:
+                draft_prob = torch.maximum(
+                    target_probs - draft_probs,
+                    torch.tensor(0.0, pin_memory=True).to(device, non_blocking=True),
+                )
+                prob = torch.where(
+                    use_target_max_recovery_mask[:, None],
+                    modified_target_probs,
+                    draft_prob,
+                )
 
         else:
             prob = torch.maximum(
@@ -1323,11 +1925,22 @@ def rejection_random_sample_block_verify_pytorch(
     IS_NGRAM=False,
     target_indices=None,  # [num_tokens, selected_vocab_size] global vocab indices
     enable_reduce_sampling=False,
+    entropy_probs=None,  # [num_tokens, vocab_size]
+    target_max_probs=None,  # [num_tokens]
+    target_max_request_mask=None,  # [batch_size]
+    no_draft_probs_target_prob_threshold: float = (
+        EAGLE_ACCEPTANCE_TARGET_PROB_THRESHOLD_DEFAULT
+    ),
+    no_draft_probs_acceptance_beta: float = EAGLE_ACCEPTANCE_BETA_DEFAULT,
+    eagle3_acceptance_alpha: float = 1.0,
+    adjust_eagle3_acceptance: bool = False,
     ENTROPY_VERIFY=False,
     POSTERIOR_THRESHOLD=0.95,
     POSTERIOR_ALPHA=0.4,
     EPSILON=1e-10,
     ori_target_probs=None,
+    use_target_max_for_no_draft_probs: bool = False,
+    use_target_max_request_mask_for_no_draft_probs: bool = False,
 ):
     batch_size = output_token_ids.shape[0]
     device = output_token_ids.device
@@ -1344,10 +1957,54 @@ def rejection_random_sample_block_verify_pytorch(
     global_token_indices = cu_start[:, None] + pos_indices
     global_token_indices = global_token_indices.clamp(0, draft_token_ids.shape[0] - 1)
     draft_tokens = draft_token_ids[global_token_indices]
-    placeholder_mask = draft_tokens == PLACEHOLDER_TOKEN_ID
-    safe_draft_tokens = draft_tokens.masked_fill(placeholder_mask, 0)
+    valid_draft_token_mask = draft_tokens != PLACEHOLDER_TOKEN_ID
+    safe_draft_tokens = draft_tokens.masked_fill(~valid_draft_token_mask, 0)
 
-    if IS_NGRAM:
+    use_any_target_max_for_no_draft_probs = (
+        use_target_max_for_no_draft_probs
+        or use_target_max_request_mask_for_no_draft_probs
+    )
+    if use_target_max_request_mask_for_no_draft_probs:
+        if target_max_request_mask is None:
+            target_max_request_mask = torch.zeros(
+                (batch_size,),
+                dtype=torch.bool,
+                device=device,
+            )
+        target_max_request_mask = target_max_request_mask.to(
+            device=device,
+            dtype=torch.bool,
+            non_blocking=True,
+        )
+        target_max_acceptance_mask = target_max_request_mask[:, None]
+    else:
+        target_max_acceptance_mask = None
+
+    if use_any_target_max_for_no_draft_probs:
+        if target_max_probs is None:
+            target_max_probs = target_probs.max(dim=-1).values
+        target_max_token_probs = target_max_probs[global_token_indices]
+        if use_target_max_request_mask_for_no_draft_probs:
+            if IS_NGRAM:
+                ones_cpu = torch.ones(1, pin_memory=True, dtype=torch.float32)
+                fallback_token_probs = ones_cpu.to(
+                    device, non_blocking=True
+                ).expand_as(draft_tokens)
+            else:
+                flat_indices = global_token_indices.flatten()
+                flat_draft_tokens = safe_draft_tokens.flatten()
+                flat_draft_probs = draft_probs[flat_indices, flat_draft_tokens]
+                fallback_token_probs = flat_draft_probs.view(
+                    batch_size, max_spec_len
+                )
+            draft_token_probs = torch.where(
+                target_max_acceptance_mask,
+                target_max_token_probs,
+                fallback_token_probs,
+            )
+        else:
+            draft_token_probs = target_max_token_probs
+    elif IS_NGRAM:
         ones_cpu = torch.ones(1, pin_memory=True, dtype=torch.float32)
         draft_token_probs = ones_cpu.to(device, non_blocking=True).expand_as(draft_tokens)
     else:
@@ -1382,25 +2039,72 @@ def rejection_random_sample_block_verify_pytorch(
         target_token_probs = flat_target_probs.view(batch_size, max_spec_len)
 
     uniform_token_probs = uniform_probs[global_token_indices]
+    if adjust_eagle3_acceptance:
+        adjusted_uniform_probs = uniform_token_probs / eagle3_acceptance_alpha
+        if (
+            use_target_max_request_mask_for_no_draft_probs
+            and target_max_acceptance_mask is not None
+        ):
+            uniform_token_probs = torch.where(
+                target_max_acceptance_mask,
+                uniform_token_probs,
+                adjusted_uniform_probs,
+            )
+        else:
+            uniform_token_probs = adjusted_uniform_probs
     recovered_tokens = recovered_token_ids[global_token_indices]
 
     pi = target_token_probs / draft_token_probs
+    if use_target_max_for_no_draft_probs:
+        pi = pi * no_draft_probs_acceptance_beta
+    elif use_target_max_request_mask_for_no_draft_probs:
+        pi = torch.where(
+            target_max_acceptance_mask,
+            pi * no_draft_probs_acceptance_beta,
+            pi,
+        )
     pi = pi.clamp(max=1.0)
     pi = torch.cumprod(pi, dim=-1)
     cum_uniform_token_probs = torch.cumprod(uniform_token_probs, dim=-1)
 
     if ENTROPY_VERIFY:
-        entropy_probs = ori_target_probs if ori_target_probs is not None else target_probs
+        entropy_probs = (
+            entropy_probs
+            if entropy_probs is not None
+            else (ori_target_probs if ori_target_probs is not None else target_probs)
+        )
         all_target_dist = entropy_probs[global_token_indices]
         entropy = -(all_target_dist * torch.log(all_target_dist + EPSILON)).sum(dim=-1)
         exp_neg_entropy = torch.exp(-entropy * POSTERIOR_ALPHA)
         posterior_threshold_device = torch.tensor(POSTERIOR_THRESHOLD, device=device, dtype=torch.float32)
         threshold = torch.minimum(exp_neg_entropy, posterior_threshold_device)
         modified_cum_uniform_token_probs = threshold * cum_uniform_token_probs
-        legal_mask = (draft_token_probs > 0) & (pi >= modified_cum_uniform_token_probs)
-    else:
-        legal_mask = (draft_token_probs > 0) & (pi >= cum_uniform_token_probs)
-    legal_mask = legal_mask & valid_mask & (~placeholder_mask)
+        if (
+            use_target_max_request_mask_for_no_draft_probs
+            and target_max_acceptance_mask is not None
+        ):
+            cum_uniform_token_probs = torch.where(
+                target_max_acceptance_mask,
+                cum_uniform_token_probs,
+                modified_cum_uniform_token_probs,
+            )
+        else:
+            cum_uniform_token_probs = modified_cum_uniform_token_probs
+    legal_mask = (draft_token_probs > 0) & (pi >= cum_uniform_token_probs)
+    if use_target_max_for_no_draft_probs:
+        legal_mask = legal_mask & (
+            target_token_probs >= no_draft_probs_target_prob_threshold
+        )
+    elif use_target_max_request_mask_for_no_draft_probs:
+        threshold_condition = target_token_probs >= no_draft_probs_target_prob_threshold
+        legal_mask = legal_mask & torch.where(
+            target_max_acceptance_mask,
+            threshold_condition,
+            torch.ones_like(threshold_condition, dtype=torch.bool),
+        )
+    legal_mask = legal_mask & valid_mask & valid_draft_token_mask
+    legal_prefix_mask = torch.cumprod(legal_mask.to(torch.int32), dim=-1).bool()
+    legal_mask = legal_mask & legal_prefix_mask
 
     last_accept_pos = torch.where(
         legal_mask.any(dim=-1, keepdim=True),
@@ -1435,6 +2139,8 @@ def sample_recovered_tokens_blockwise_pytorch(
     IS_NGRAM=False,
     target_indices=None,  # [num_tokens, selected_vocab_size] global vocab indices
     enable_reduce_sampling=False,
+    target_max_request_mask=None,
+    use_target_max_request_mask_for_no_draft_probs: bool = False,
 ):
     _ = vocab_size
     device = output_token_ids.device
@@ -1459,6 +2165,21 @@ def sample_recovered_tokens_blockwise_pytorch(
     pos_in_seq = token_indices - cu_start[token_to_batch]
 
     max_spec_len = int((cu_end - cu_start).max().item())
+
+    use_target_max_recovery_mask = None
+    if use_target_max_request_mask_for_no_draft_probs:
+        if target_max_request_mask is None:
+            target_max_request_mask = torch.zeros(
+                (cu_num_draft_tokens.shape[0],),
+                dtype=torch.bool,
+                device=device,
+            )
+        target_max_request_mask = target_max_request_mask.to(
+            device=device,
+            dtype=torch.bool,
+            non_blocking=True,
+        )
+        use_target_max_recovery_mask = target_max_request_mask[token_to_batch]
 
     if IS_NGRAM:
         draft_token_scalar_probs = torch.ones(num_tokens, device=device, dtype=torch.float32)
@@ -1512,7 +2233,7 @@ def sample_recovered_tokens_blockwise_pytorch(
 
     if enable_reduce_sampling:
         # enable reduce_sampling: residual computation with selected vocab
-        if IS_NGRAM:
+        if IS_NGRAM or use_target_max_request_mask_for_no_draft_probs:
             # Zero out the draft token in target_probs
             prob = target_probs.clone()
             for i in range(num_tokens):
@@ -1520,7 +2241,28 @@ def sample_recovered_tokens_blockwise_pytorch(
                 if draft_id != PLACEHOLDER_TOKEN_ID:
                     mask = target_indices[i] == draft_id
                     prob[i, mask] = 0
-            residual = torch.clamp(p_i_expanded * prob, min=0.0)
+            if IS_NGRAM:
+                residual = torch.clamp(p_i_expanded * prob, min=0.0)
+            else:
+                # Gather draft probs at candidate indices (same as sample_recovered_tokens_pytorch)
+                flat_indices = target_indices.flatten()
+                token_offsets = torch.arange(num_tokens, device=device)[:, None] * draft_probs.shape[1]
+                flat_token_offsets = token_offsets.expand_as(target_indices).flatten()
+
+                draft_probs_flat = draft_probs.flatten()
+                valid_mask = flat_indices < draft_probs.shape[1]
+                flat_draft_probs_at_indices = torch.where(
+                    valid_mask, draft_probs_flat[flat_token_offsets + flat_indices], torch.tensor(0.0, device=device)
+                )
+                draft_probs_at_indices = flat_draft_probs_at_indices.view(num_tokens, -1)
+
+                draft_residual = torch.clamp(p_i_expanded * target_probs - draft_probs_at_indices, min=0.0)
+                target_max_residual = torch.clamp(p_i_expanded * prob, min=0.0)
+                residual = torch.where(
+                    use_target_max_recovery_mask[:, None],
+                    target_max_residual,
+                    draft_residual,
+                )
         else:
             # Gather draft probs at candidate indices (same as sample_recovered_tokens_pytorch)
             flat_indices = target_indices.flatten()
@@ -1537,14 +2279,23 @@ def sample_recovered_tokens_blockwise_pytorch(
             residual = torch.clamp(p_i_expanded * target_probs - draft_probs_at_indices, min=0.0)
     else:
         # normal mode
-        if IS_NGRAM:
+        if IS_NGRAM or use_target_max_request_mask_for_no_draft_probs:
             modified_target = target_probs.clone()
             valid_draft_mask = draft_token_ids != PLACEHOLDER_TOKEN_ID
             modified_target[
                 token_indices[valid_draft_mask],
                 draft_token_ids[valid_draft_mask],
             ] = 0.0
-            residual = torch.clamp(p_i_expanded * modified_target, min=0.0)
+            if IS_NGRAM:
+                residual = torch.clamp(p_i_expanded * modified_target, min=0.0)
+            else:
+                draft_residual = torch.clamp(p_i_expanded * target_probs - draft_probs, min=0.0)
+                target_max_residual = torch.clamp(p_i_expanded * modified_target, min=0.0)
+                residual = torch.where(
+                    use_target_max_recovery_mask[:, None],
+                    target_max_residual,
+                    draft_residual,
+                )
         else:
             residual = torch.clamp(p_i_expanded * target_probs - draft_probs, min=0.0)
 

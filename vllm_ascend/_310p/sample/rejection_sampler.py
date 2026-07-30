@@ -68,6 +68,8 @@ class AscendRejectionSampler310(AscendRejectionSampler):
         target_indices: torch.Tensor | None = None,
         global_vocab_size: int | None = None,
         enable_reduce_sampling: bool = False,
+        target_max_request_mask: torch.Tensor | None = None,
+        use_target_max_request_mask_for_no_draft_probs: bool = False,
     ) -> torch.Tensor:
         batch_size = len(num_draft_tokens)
         vocab_size = target_probs.shape[-1]
@@ -94,6 +96,10 @@ class AscendRejectionSampler310(AscendRejectionSampler):
                 IS_NGRAM=draft_probs is None,
                 target_indices=target_indices,
                 enable_reduce_sampling=enable_reduce_sampling,
+                target_max_request_mask=target_max_request_mask,
+                use_target_max_request_mask_for_no_draft_probs=(
+                    use_target_max_request_mask_for_no_draft_probs
+                ),
             )
         else:
             sample_recovered_tokens_pytorch(
@@ -107,5 +113,9 @@ class AscendRejectionSampler310(AscendRejectionSampler):
                 IS_NGRAM=draft_probs is None,
                 target_indices=target_indices,
                 enable_reduce_sampling=enable_reduce_sampling,
+                target_max_request_mask=target_max_request_mask,
+                use_target_max_request_mask_for_no_draft_probs=(
+                    use_target_max_request_mask_for_no_draft_probs
+                ),
             )
         return recovered_token_ids
