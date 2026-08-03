@@ -66,6 +66,8 @@ public:
                                    uint32_t dealRowCount, uint32_t columnCount, uint32_t actualColumnCount);
     // ================================Vector0==========================================
     __aicore__ inline void MergeKv(const RunInfo &runInfo);
+    __aicore__ inline void PrefetchMergeIndices(int64_t qsfaS2GmStartOffset, int64_t qsfaS2GmLimit,
+                                                int64_t topkGmBaseOffset, const RunInfo &runInfo);
     __aicore__ inline int64_t GetKeyBNBOffset(int64_t realS2Idx, const RunInfo &runInfo, int64_t s2IdLimit);
     __aicore__ inline void GetRealS2Idx(int64_t s2GmOffset, int64_t &realS2Idx, int64_t topkGmBaseOffset,
                                         const RunInfo &runInfo);
@@ -137,6 +139,13 @@ private:
     static constexpr uint64_t SYNC_INPUT_BUF2_FLAG = 4;
     static constexpr uint64_t SYNC_OUTPUT_BUF1_FLAG = 4;
     static constexpr uint64_t SYNC_OUTPUT_BUF2_FLAG = 5;
+    // Reuse v0ValidSizeBuff(8K=2048 int32): [0,128) valid-size writeout; [128,640) topk; [640,2048) block_table
+    static constexpr uint32_t MERGE_VALID_SIZE_RESERVE = 128;
+    static constexpr uint32_t MERGE_TOPK_UB_OFFSET = MERGE_VALID_SIZE_RESERVE;
+    static constexpr uint32_t MERGE_TOPK_UB_MAX = 512;
+    static constexpr uint32_t MERGE_BLK_TABLE_UB_OFFSET = MERGE_TOPK_UB_OFFSET + MERGE_TOPK_UB_MAX;
+    static constexpr uint32_t MERGE_BLK_TABLE_UB_MAX =
+        ConstInfo::BUFFER_SIZE_BYTE_8K / sizeof(int32_t) - MERGE_BLK_TABLE_UB_OFFSET;
     static constexpr uint32_t INPUT1_BUFFER_OFFSET = ConstInfo::BUFFER_SIZE_BYTE_32K;
     static constexpr uint32_t SOFTMAX_TMP_BUFFER_OFFSET = ConstInfo::BUFFER_SIZE_BYTE_512B / sizeof(T);
     static constexpr uint32_t BASE_BLOCK_MAX_ELEMENT_NUM = ConstInfo::BUFFER_SIZE_BYTE_32K / sizeof(T);  // 32768/4=8096
@@ -198,6 +207,11 @@ private:
     LocalTensor<T> softmaxExpUb;
     LocalTensor<KV_T> kvMergUb_;
     LocalTensor<int32_t> v0ValidSizeUb_;
+
+    // MergeKv index prefetch: topk / block_table cached in v0ValidSizeUb_
+    bool mergeTopkCached_ = false;
+    bool mergeBlkTableCached_ = false;
+    int64_t mergeTopkUbStartIdx_ = 0;
 };
 
 template <typename QSFAT> __aicore__ inline void QSFAVectorService<QSFAT>::InitBuffers(TPipe *pipe)
@@ -619,6 +633,75 @@ __aicore__ inline void QSFAVectorService<QSFAT>::ProcessVec1SingleBuf(const RunI
 }
 
 template <typename QSFAT>
+__aicore__ inline void QSFAVectorService<QSFAT>::PrefetchMergeIndices(int64_t qsfaS2GmStartOffset,
+                                                                       int64_t qsfaS2GmLimit,
+                                                                       int64_t topkGmBaseOffset,
+                                                                       const RunInfo &runInfo)
+{
+    mergeTopkCached_ = false;
+    mergeBlkTableCached_ = false;
+    mergeTopkUbStartIdx_ = 0;
+
+    if (qsfaS2GmStartOffset >= qsfaS2GmLimit) {
+        return;
+    }
+
+    int64_t topkStart =
+        (qsfaS2GmStartOffset + runInfo.s2Idx * constInfo.s2BaseSize) / constInfo.sparseBlockSize;
+    int64_t topkEnd =
+        (qsfaS2GmLimit - 1 + runInfo.s2Idx * constInfo.s2BaseSize) / constInfo.sparseBlockSize;
+    if (topkStart < 0) {
+        topkStart = 0;
+    }
+    if (topkEnd >= static_cast<int64_t>(constInfo.sparseBlockCount)) {
+        topkEnd = static_cast<int64_t>(constInfo.sparseBlockCount) - 1;
+    }
+    int64_t topkCount = (topkEnd >= topkStart) ? (topkEnd - topkStart + 1) : 0;
+
+    DataCopyExtParams dataCopyParams;
+    dataCopyParams.blockCount = 1;
+    dataCopyParams.srcStride = 0;
+    dataCopyParams.dstStride = 0;
+    DataCopyPadExtParams<int32_t> padParams;
+    padParams.isPad = false;
+    padParams.leftPadding = 0;
+    padParams.rightPadding = 0;
+    padParams.paddingValue = 0;
+
+    if (topkCount > 0 && topkCount <= static_cast<int64_t>(MERGE_TOPK_UB_MAX)) {
+        uint32_t topkCountU32 = static_cast<uint32_t>(topkCount);
+        uint32_t topkCountAlign = CeilAlign(topkCountU32, static_cast<uint32_t>(BYTE_BLOCK / sizeof(int32_t)));
+        if (topkCountAlign <= MERGE_TOPK_UB_MAX) {
+            dataCopyParams.blockLen = topkCountU32 * sizeof(int32_t);
+            padParams.isPad = (topkCountAlign > topkCountU32);
+            padParams.rightPadding = topkCountAlign - topkCountU32;
+            DataCopyPad(v0ValidSizeUb_[MERGE_TOPK_UB_OFFSET], topkGm_[topkGmBaseOffset + topkStart], dataCopyParams,
+                        padParams);
+            mergeTopkCached_ = true;
+            mergeTopkUbStartIdx_ = topkStart;
+        }
+    }
+
+    if constexpr (PAGE_ATTENTION) {
+        uint32_t blkNum = constInfo.maxBlockNumPerBatch;
+        uint32_t blkNumAlign = CeilAlign(blkNum, static_cast<uint32_t>(BYTE_BLOCK / sizeof(int32_t)));
+        if (blkNum > 0 && blkNumAlign <= MERGE_BLK_TABLE_UB_MAX) {
+            dataCopyParams.blockLen = blkNum * sizeof(int32_t);
+            padParams.isPad = (blkNumAlign > blkNum);
+            padParams.rightPadding = blkNumAlign - blkNum;
+            DataCopyPad(v0ValidSizeUb_[MERGE_BLK_TABLE_UB_OFFSET],
+                        blkTableGm_[runInfo.bIdx * constInfo.maxBlockNumPerBatch], dataCopyParams, padParams);
+            mergeBlkTableCached_ = true;
+        }
+    }
+
+    if (mergeTopkCached_ || mergeBlkTableCached_) {
+        SetFlag<HardEvent::MTE2_S>(0);
+        WaitFlag<HardEvent::MTE2_S>(0);
+    }
+}
+
+template <typename QSFAT>
 __aicore__ inline void QSFAVectorService<QSFAT>::GetRealS2Idx(int64_t s2GmOffset, int64_t &realS2Idx,
                                                               int64_t topkGmBaseOffset, const RunInfo &runInfo)
 {
@@ -627,7 +710,13 @@ __aicore__ inline void QSFAVectorService<QSFAT>::GetRealS2Idx(int64_t s2GmOffset
         realS2Idx = -1;
         return;
     }
-    realS2Idx = topkGm_.GetValue(topkGmBaseOffset + qsfaTopkGmIdx) * static_cast<int64_t>(constInfo.sparseBlockSize) +
+    int32_t topkVal;
+    if (mergeTopkCached_) {
+        topkVal = v0ValidSizeUb_.GetValue(MERGE_TOPK_UB_OFFSET + (qsfaTopkGmIdx - mergeTopkUbStartIdx_));
+    } else {
+        topkVal = topkGm_.GetValue(topkGmBaseOffset + qsfaTopkGmIdx);
+    }
+    realS2Idx = static_cast<int64_t>(topkVal) * static_cast<int64_t>(constInfo.sparseBlockSize) +
                 static_cast<int64_t>((s2GmOffset + runInfo.s2Idx * constInfo.s2BaseSize) % constInfo.sparseBlockSize);
 }
 
@@ -642,7 +731,13 @@ __aicore__ inline int64_t QSFAVectorService<QSFAT>::GetKeyBNBOffset(int64_t real
     if constexpr (PAGE_ATTENTION) {
         int64_t blkTableIdx = realS2Idx / constInfo.kvCacheBlockSize;
         int64_t blkTableOffset = realS2Idx % constInfo.kvCacheBlockSize;
-        realKeyBNBOffset = blkTableGm_.GetValue(runInfo.bIdx * constInfo.maxBlockNumPerBatch + blkTableIdx) *
+        int32_t blkTableVal;
+        if (mergeBlkTableCached_) {
+            blkTableVal = v0ValidSizeUb_.GetValue(MERGE_BLK_TABLE_UB_OFFSET + blkTableIdx);
+        } else {
+            blkTableVal = blkTableGm_.GetValue(runInfo.bIdx * constInfo.maxBlockNumPerBatch + blkTableIdx);
+        }
+        realKeyBNBOffset = static_cast<int64_t>(blkTableVal) *
                                 static_cast<int64_t>(constInfo.kvCacheBlockSize) *
                                 static_cast<int64_t>(constInfo.kvHeadNum) +
                                 blkTableOffset;
@@ -880,6 +975,8 @@ __aicore__ inline void QSFAVectorService<QSFAT>::MergeKv(const RunInfo &runInfo)
     if (qsfaS2GmLimit > s2ProcessSize) {
         qsfaS2GmLimit = s2ProcessSize;
     }
+    // 将本 AIV 负责的 topk（及 block_table 整行）批量搬入 UB，循环内避免 GM scalar GetValue
+    PrefetchMergeIndices(qsfaS2GmStartOffset, qsfaS2GmLimit, topkGmBaseOffset, runInfo);
     for (int64_t s2GmOffsetArray = qsfaS2GmStartOffset; s2GmOffsetArray < qsfaS2GmLimit; s2GmOffsetArray += 2 *
         constInfo.sparseBlockSize) {
         if (qsfaNeedWaitMte3ToMte2) {

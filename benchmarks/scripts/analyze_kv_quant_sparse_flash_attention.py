@@ -322,7 +322,12 @@ def build_profiler(out_dir: Path):
         record_op_args=False,
         gc_detect_threshold=None,
     )
-    return torch_npu.profiler.profile(
+    # Explicit schedule + prof.step() avoids "Stop while RECORD" warnings.
+    try:
+        schedule = torch_npu.profiler.schedule(wait=0, warmup=1, active=3, repeat=1)
+    except TypeError:
+        schedule = None
+    kwargs = dict(
         activities=[
             torch_npu.profiler.ProfilerActivity.CPU,
             torch_npu.profiler.ProfilerActivity.NPU,
@@ -333,23 +338,28 @@ def build_profiler(out_dir: Path):
         with_stack=False,
         with_modules=False,
     )
+    if schedule is not None:
+        kwargs["schedule"] = schedule
+    return torch_npu.profiler.profile(**kwargs)
 
 
 def run_profile(fn, out_dir: Path, steps: int = 5) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    prof = build_profiler(out_dir)
-    prof.start()
-    try:
+    # wait=0 + warmup=1 + active=3 => need at least 4 step() calls.
+    steps = max(steps, 4)
+    with build_profiler(out_dir) as prof:
         for _ in range(steps):
             fn()
             torch.npu.synchronize()
-    finally:
-        prof.stop()
+            prof.step()
     log(f"[profile] raw traces under {out_dir}")
+    # Find newest ascend_pt dir for analyse hint
+    ascend_pts = sorted(out_dir.glob("*_ascend_pt"), key=lambda p: p.stat().st_mtime)
+    analyse_target = str(ascend_pts[-1]) if ascend_pts else str(out_dir)
     log("[profile] next: analyse traces, e.g.")
     log("  python - <<'PY'")
     log("  from torch_npu.profiler.profiler import analyse")
-    log(f"  analyse(r'{out_dir}')")
+    log(f"  analyse(r'{analyse_target}')")
     log("  PY")
     log(
         "[profile] then inspect ASCEND_PROFILER_OUTPUT / op_summary_*.csv / "
