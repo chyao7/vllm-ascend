@@ -1,0 +1,16 @@
+model = "deepseek_v3_2"
+model_provider = "cmecloud"
+
+[model_providers.cmecloud]
+name = "Local DeepSeek"
+base_url = "http://127.0.0.1:9100/v1"
+wire_api = "responses"
+
+[projects."/workspace"]
+trust_level = "trusted"
+
+[projects."/root/vllm-ascend"]
+trust_level = "trusted"
+
+[tui.model_availability_nux]
+"gpt-5.6-sol" = 4
