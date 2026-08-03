@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import shlex
 import sys
 import time
@@ -213,6 +214,41 @@ def make_inputs(
     }
 
 
+def prepare_backend(backend: str) -> str:
+    """Select API and avoid broken custom-opp shadowing CANN built-in kernels."""
+    custom_opp = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
+    if backend == "torch_npu":
+        if custom_opp:
+            log(
+                f"[warn] ASCEND_CUSTOM_OPP_PATH is set:\n  {custom_opp}\n"
+                "  Clearing it for this process so torch_npu uses CANN built-in "
+                "KvQuantSparseFlashAttention (custom opp is missing tilingKey 578)."
+            )
+            os.environ.pop("ASCEND_CUSTOM_OPP_PATH", None)
+        if "vllm_ascend_C" in sys.modules or hasattr(torch.ops, "_C_ascend"):
+            log(
+                "[warn] vllm_ascend_C / torch.ops._C_ascend already loaded in this "
+                "process. Prefer a fresh python process for --backend torch_npu."
+            )
+        if not hasattr(torch_npu, "npu_kv_quant_sparse_flash_attention"):
+            raise SystemExit(
+                "torch_npu.npu_kv_quant_sparse_flash_attention not found; "
+                "upgrade torch_npu/CANN or use a build that ships this API."
+            )
+        log("[backend] torch_npu.npu_kv_quant_sparse_flash_attention (CANN built-in)")
+        return backend
+
+    # custom
+    if not try_enable_custom_op():
+        raise SystemExit(
+            "custom backend unavailable. Re-run with --backend torch_npu "
+            "in a clean process."
+        )
+    log("[backend] torch.ops._C_ascend.npu_kv_quant_sparse_flash_attention")
+    log(f"[backend] ASCEND_CUSTOM_OPP_PATH={os.environ.get('ASCEND_CUSTOM_OPP_PATH', '')!r}")
+    return backend
+
+
 def run_op(inputs: dict, *, backend: str):
     kwargs = dict(
         query=inputs["query"],
@@ -230,6 +266,7 @@ def run_op(inputs: dict, *, backend: str):
             **kwargs, return_softmax_lse=False
         )
         return out[0] if isinstance(out, tuple) else out
+    # Must call torch_npu API directly — never _C_ascend.
     return torch_npu.npu_kv_quant_sparse_flash_attention(**kwargs)
 
 
@@ -465,9 +502,10 @@ def main() -> None:
 
     info = device_info()
     log(f"[device] {json.dumps(info, ensure_ascii=False)}")
+    log(f"[args] backend={args.backend} scenario={args.scenario} batch={batch} "
+        f"t={q_per_req} kv={kv_seq} heads={args.heads} profile={args.profile}")
 
-    if args.backend == "custom" and not try_enable_custom_op():
-        raise SystemExit("custom backend unavailable; try --backend torch_npu in a clean process")
+    prepare_backend(args.backend)
 
     inputs = make_inputs(
         batch=batch,
