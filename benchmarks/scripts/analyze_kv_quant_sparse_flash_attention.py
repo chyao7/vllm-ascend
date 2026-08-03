@@ -11,28 +11,28 @@ Aligned with Ascend C operator profiling guidance:
 
 Typical 910B2 DS32-C8 scenarios::
 
-    # 1-concurrency decode @12k (expect ~1 Mix core group busy)
+    # Default uses torch_npu (CANN op). Avoid _C_ascend if you see tilingKey miss.
     python benchmarks/scripts/analyze_kv_quant_sparse_flash_attention.py \\
-        --scenario decode --batch 1 --kv 12288 --heads 16 --profile
+        --scenario decode --batch 1 --kv 12288 --heads 128 --profile
 
-    # 16-concurrency decode @12k (expect up to 16/24 Cube busy)
+    # 16-concurrency decode @12k
     python benchmarks/scripts/analyze_kv_quant_sparse_flash_attention.py \\
-        --scenario decode --batch 16 --kv 12288 --heads 16 --profile
+        --scenario decode --batch 16 --kv 12288 --heads 128 --profile
 
-    # Prefill chunk 2k into 12k cache
+    # Prefill chunk
     python benchmarks/scripts/analyze_kv_quant_sparse_flash_attention.py \\
-        --scenario prefill --batch 1 --t 2048 --kv 12288 --heads 16 --profile
+        --scenario prefill --batch 1 --t 2048 --kv 12288 --heads 128 --profile
 
-    # Print msprof wrapper command only
+    # Custom path only if your vllm_ascend_C + custom opp match host tiling:
     python benchmarks/scripts/analyze_kv_quant_sparse_flash_attention.py \\
-        --scenario decode --batch 1 --kv 12288 --print-msprof
+        --scenario decode --batch 1 --kv 12288 --heads 128 --backend custom --profile
 
 Notes:
-  - Prefer ``--backend custom`` (``_C_ascend``) for production path.
-  - Do not mix ``torch_npu`` and ``_C_ascend`` in the same process.
+  - Default ``--backend torch_npu``. Do **not** load ``_C_ascend`` in the same process.
+  - ``not find tilingKey[578]`` means host tiling/custom kernel binary mismatch for
+    ``KvQuantSparseFlashAttention``; use torch_npu or rebuild custom opp.
   - After ``--profile``, run ``analyse()`` on the generated ``*_ascend_pt`` dir,
-    then inspect ``op_summary_*.csv`` / PipeUtilization (aic_mac_ratio, aic_mte2_ratio,
-    aiv_mte2_time, Block Dim, Duration).
+    then inspect ``op_summary_*.csv`` / PipeUtilization.
 """
 
 from __future__ import annotations
@@ -391,8 +391,12 @@ def main() -> None:
     parser.add_argument(
         "--heads",
         type=int,
-        default=16,
-        help="local Q heads G (e.g. 128/TP). Use 16 for TP=8",
+        default=128,
+        help=(
+            "local Q heads G (query.shape[1]). Default 128 matches DS MLA full heads / "
+            "existing bench. For TP-sharded local heads use 8/16/32/...; if custom op "
+            "raises 'not find tilingKey', try --heads 128 or --backend torch_npu."
+        ),
     )
     parser.add_argument("--topk", type=int, default=INDEX_TOPK)
     parser.add_argument("--warmup", type=int, default=10)
@@ -401,8 +405,12 @@ def main() -> None:
     parser.add_argument(
         "--backend",
         choices=("custom", "torch_npu"),
-        default="custom",
-        help="production path is custom (_C_ascend)",
+        default="torch_npu",
+        help=(
+            "torch_npu: CANN built-in op (default; use for profiling when custom "
+            "tilingKey is missing). custom: torch.ops._C_ascend (needs matching "
+            "ASCEND_CUSTOM_OPP_PATH / rebuilt kernels)."
+        ),
     )
     parser.add_argument(
         "--profile",
@@ -484,8 +492,27 @@ def main() -> None:
         return run_op(inputs, backend=args.backend)
 
     # Correctness smoke
-    out = _once()
-    torch.npu.synchronize()
+    try:
+        out = _once()
+        torch.npu.synchronize()
+    except Exception as e:
+        msg = str(e)
+        log(f"[error] op launch failed: {type(e).__name__}: {e}")
+        if "tilingKey" in msg or "tiling" in msg.lower() or "EZ1001" in msg:
+            log(
+                "[hint] Host tiling produced a key not present in the loaded kernel binary.\n"
+                "  This is a CANN custom-opp / vllm_ascend_C mismatch (not heads/shape).\n"
+                "  Fix:\n"
+                "    1) Open a NEW process (do not load _C_ascend) and run:\n"
+                "         --backend torch_npu --heads 128 --profile\n"
+                "    2) Or rebuild/install matching custom opp under\n"
+                "         vllm_ascend/_cann_ops_custom/vendors/custom_transformer\n"
+                "       so KvQuantSparseFlashAttention contains tilingKey 578\n"
+                "       (TND + PA_BSND + V_TEMPLATE).\n"
+                f"  Current: backend={args.backend} heads={args.heads} "
+                f"T={meta['total_q']} kv={kv_seq}"
+            )
+        raise
     log(f"[smoke] out={tuple(out.shape)} dtype={out.dtype}")
 
     ms = bench(_once, warmup=args.warmup, iters=args.iters)
