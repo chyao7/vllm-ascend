@@ -437,13 +437,19 @@ class NPUPlatform(Platform):
             return
 
         kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
-        if kv_transfer_config is not None and getattr(kv_transfer_config, "kv_role", None) == "kv_producer":
+        if kv_transfer_config is not None and getattr(kv_transfer_config, "kv_role", None) in (
+            "kv_producer",
+            "kv_consumer",
+        ):
+            # Prefill PP+MTP is supported. Decode PP+MTP is supported only for the
+            # aligned P/D PP topology enforced by MooncakeConnector.
             return
 
         raise ValueError(
-            "PP+MTP is only supported on PD-disaggregated P nodes "
-            "(kv_role='kv_producer'). D nodes must use "
-            "pipeline_parallel_size=1 and may combine data parallelism with MTP."
+            "PP+MTP is only supported on PD-disaggregated nodes "
+            "(kv_role='kv_producer' or aligned kv_consumer with matching "
+            "prefill/decode pp_size). Non-PD deployments must use "
+            "pipeline_parallel_size=1 with MTP."
         )
 
     @classmethod

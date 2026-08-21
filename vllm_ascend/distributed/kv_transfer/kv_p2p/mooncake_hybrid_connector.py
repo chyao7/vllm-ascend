@@ -385,11 +385,13 @@ class KVCacheRecvingThread(threading.Thread):
         kv_cache_config: KVCacheConfig,
         kv_caches: dict[str, Any],
         prefill_pp_layer_partition: str | None = None,
+        decode_pp_size: int = 1,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingThread")
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self._prefill_pp_size = _prefill_pp_size
+        self._decode_pp_size = decode_pp_size
         self.local_engine_id = local_engine_id
         self.local_handshake_port = local_handshake_port
         self.side_channel_port = side_channel_port
@@ -777,9 +779,14 @@ class KVCacheRecvingThread(threading.Thread):
             if prefill_pp_rank == self._prefill_pp_size - 1:
                 end_layer_index = end_layer_index + 1
         num_cache_per_layer = len(list(self.kv_caches.values())[0])  # Number of KV caches per layer
-        local_kv_caches_base_addrs = local_kv_caches_base_addrs_all[
-            first_layer_index * num_cache_per_layer : end_layer_index * num_cache_per_layer
-        ]
+        # Aligned D-PP: each Decode stage only registers its local layers densely,
+        # matching the Prefill stage layout, so no global-layer slice is needed.
+        if self._decode_pp_size > 1:
+            local_kv_caches_base_addrs = local_kv_caches_base_addrs_all
+        else:
+            local_kv_caches_base_addrs = local_kv_caches_base_addrs_all[
+                first_layer_index * num_cache_per_layer : end_layer_index * num_cache_per_layer
+            ]
         logger.debug("transfer kv cache first_layer_index:%s , end_layer_index:%s", first_layer_index, end_layer_index)
         num_blocks = len(local_block_ids)
         session_id = f"{remote_host}:{remote_transfer_port}"
@@ -824,7 +831,11 @@ class KVCacheRecvingThread(threading.Thread):
 
         # Determine if the current position is the offset position at the end of
         # the KV transmission.
-        is_kv_transfer_end = global_offset == tp_num_need_pulls * self._prefill_pp_size - 1
+        if self._decode_pp_size > 1:
+            # Aligned D-PP only pulls one Prefill stage; finish after that stage.
+            is_kv_transfer_end = (global_offset % tp_num_need_pulls) == (tp_num_need_pulls - 1)
+        else:
+            is_kv_transfer_end = global_offset == tp_num_need_pulls * self._prefill_pp_size - 1
         need_cat_cache = tp_num_need_pulls > 1 and is_kv_transfer_end
         need_nz_cache = get_ascend_config().enable_kv_nz and is_kv_transfer_end
         use_fused_op = get_ascend_config().enable_transpose_kv_cache_by_block
@@ -1509,6 +1520,7 @@ class MooncakeConnectorWorker:
         self.max_device_id = self.tp_size * self.dp_size * self.pp_size
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.num_key_value_heads = self.vllm_config.model_config.hf_text_config.num_key_value_heads
+        self._validate_decode_pp_process_config()
 
         # kv cache config
         self.kv_cache_config = kv_cache_config
@@ -1596,10 +1608,48 @@ class MooncakeConnectorWorker:
         self._decode_tp_size = decode_parallel_config["tp_size"]
         assert "dp_size" in decode_parallel_config
         self._decode_dp_size = decode_parallel_config["dp_size"]
-        # get prefill pp size from extra config
         self._decode_pp_size = decode_parallel_config.get("pp_size", 1)
-        assert self._decode_pp_size == 1, "decode pp size must be 1"
         self._prefill_pp_layer_partition = prefill_parallel_config.get("pp_layer_partition")
+        self._decode_pp_layer_partition = decode_parallel_config.get("pp_layer_partition")
+        self._validate_aligned_decode_pp_config()
+
+    def _validate_aligned_decode_pp_config(self) -> None:
+        """Decode PP is only supported when it matches Prefill PP topology."""
+        if self._decode_pp_size < 1:
+            raise ValueError(f"decode.pp_size must be >= 1, got {self._decode_pp_size}")
+        if self._decode_pp_size == 1:
+            return
+        if self._decode_pp_size != self._prefill_pp_size:
+            raise ValueError(
+                "Aligned Decode PP requires decode.pp_size == prefill.pp_size. "
+                f"Got decode.pp_size={self._decode_pp_size}, "
+                f"prefill.pp_size={self._prefill_pp_size}."
+            )
+        if self._decode_pp_layer_partition != self._prefill_pp_layer_partition:
+            raise ValueError(
+                "Aligned Decode PP requires decode.pp_layer_partition == "
+                "prefill.pp_layer_partition. "
+                f"Got decode={self._decode_pp_layer_partition!r}, "
+                f"prefill={self._prefill_pp_layer_partition!r}."
+            )
+
+    def _validate_decode_pp_process_config(self) -> None:
+        if self.kv_role != "kv_consumer" or self._decode_pp_size == 1:
+            return
+        if self.pp_size != self._decode_pp_size:
+            raise ValueError(
+                "Decode process --pipeline-parallel-size must match "
+                "decode.pp_size in kv_connector_extra_config for aligned D-PP. "
+                f"Got process pp_size={self.pp_size}, decode.pp_size={self._decode_pp_size}."
+            )
+
+    def _decode_pp_aligned(self) -> bool:
+        return self._decode_pp_size > 1
+
+    def _target_prefill_pp_ranks(self) -> list[int]:
+        if self._decode_pp_aligned():
+            return [self.pp_rank]
+        return list(range(self._prefill_pp_size))
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data."""
@@ -1733,6 +1783,7 @@ class MooncakeConnectorWorker:
                 self.kv_cache_config,
                 self.kv_caches,
                 self._prefill_pp_layer_partition,
+                decode_pp_size=self._decode_pp_size,
             )
             self.kv_recv_thread.start()
 
@@ -1809,11 +1860,17 @@ class MooncakeConnectorWorker:
             else:  # TODO: support prefill context parallel and pipeline parallel open at the same time
                 chosen_rank_list = self._get_remote_rank(remote_req_id, prefill_tp_size)
                 remote_handshake_port_list = [[x + meta.remote_port] for x in chosen_rank_list]
-                for i in range(tp_num_need_pulls * self._prefill_pp_size):
+                target_pp_ranks = self._target_prefill_pp_ranks()
+                transfer_offsets = [
+                    pp_rank * tp_num_need_pulls + inner_offset
+                    for pp_rank in target_pp_ranks
+                    for inner_offset in range(tp_num_need_pulls)
+                ]
+                for task_idx, i in enumerate(transfer_offsets):
                     assert self.kv_recv_thread is not None
                     remote_host, remote_engine_id = self._get_remote_host_info_by_port(
                         meta.remote_port,
-                        remote_handshake_port_list[i][0],
+                        remote_handshake_port_list[task_idx][0],
                         meta.remote_host,
                         meta.remote_engine_id,
                         meta.remote_multi_nodes_meta_mapping,
@@ -1825,10 +1882,10 @@ class MooncakeConnectorWorker:
                         remote_block_ids=meta.remote_block_ids,
                         remote_engine_id=remote_engine_id,
                         remote_host=remote_host,
-                        remote_handshake_port=remote_handshake_port_list[i][0],
+                        remote_handshake_port=remote_handshake_port_list[task_idx][0],
                         offset=i,
                         tp_num_need_pulls=tp_num_need_pulls,
-                        all_task_done=(i == tp_num_need_pulls * self._prefill_pp_size - 1),
+                        all_task_done=(task_idx == len(transfer_offsets) - 1),
                     )
 
         for req_id in metadata.reqs_in_batch:
@@ -1912,11 +1969,12 @@ class MooncakeConnectorWorker:
             prefill_tp_size = self._prefill_tp_size
 
         # Divide the ports according to the TP within the PP
+        target_pp_ranks = self._target_prefill_pp_ranks()
         sampled_nums = []
         if prefill_tp_size == self._decode_tp_size:
             sampled_nums = list(
                 map(
-                    lambda tp: [tp + pp * prefill_tp_size for pp in range(self._prefill_pp_size)],
+                    lambda tp: [tp + pp * prefill_tp_size for pp in target_pp_ranks],
                     range(prefill_tp_size),
                 )
             )
@@ -1939,12 +1997,12 @@ class MooncakeConnectorWorker:
         )  # random choose a group
         all_results = [
             self._get_remote_tp_ranks(ori_data[pp_index], rand_group_index, num_groups, prefill_tp_size)
-            for pp_index in range(self._prefill_pp_size)
+            for pp_index in target_pp_ranks
         ]
         for group_index in range(len(all_results[0])):
             group = []
-            for pp_index in range(self._prefill_pp_size):
-                group.extend(all_results[pp_index][group_index])
+            for result_idx in range(len(all_results)):
+                group.extend(all_results[result_idx][group_index])
             sampled_nums.append(group)
         return sampled_nums
 

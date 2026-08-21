@@ -2007,6 +2007,7 @@ class MooncakeConnectorWorker:
         self.max_device_id = self.tp_size * self.dp_size * self.pcp_size * self.pp_size
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.num_key_value_heads = self.vllm_config.model_config.hf_text_config.num_key_value_heads
+        self._validate_decode_pp_process_config()
 
         # kv cache config
         self.kv_cache_config = kv_cache_config
@@ -2078,10 +2079,54 @@ class MooncakeConnectorWorker:
         self._decode_tp_size = decode_parallel_config["tp_size"]
         assert "dp_size" in decode_parallel_config
         self._decode_dp_size = decode_parallel_config["dp_size"]
-        # get prefill pp size from extra config
         self._decode_pp_size = decode_parallel_config.get("pp_size", 1)
-        assert self._decode_pp_size == 1, "decode pp size must be 1"
         self._prefill_pp_layer_partition = prefill_parallel_config.get("pp_layer_partition")
+        self._decode_pp_layer_partition = decode_parallel_config.get("pp_layer_partition")
+        self._validate_aligned_decode_pp_config()
+
+    def _validate_aligned_decode_pp_config(self) -> None:
+        """Decode PP is only supported when it matches Prefill PP topology.
+
+        First supported mode: ``decode.pp_size == prefill.pp_size`` and the same
+        ``pp_layer_partition`` (including both unset). Each Decode PP rank then
+        pulls KV only from the same Prefill PP rank.
+        """
+        if self._decode_pp_size < 1:
+            raise ValueError(f"decode.pp_size must be >= 1, got {self._decode_pp_size}")
+        if self._decode_pp_size == 1:
+            return
+        if self._decode_pp_size != self._prefill_pp_size:
+            raise ValueError(
+                "Aligned Decode PP requires decode.pp_size == prefill.pp_size. "
+                f"Got decode.pp_size={self._decode_pp_size}, "
+                f"prefill.pp_size={self._prefill_pp_size}."
+            )
+        if self._decode_pp_layer_partition != self._prefill_pp_layer_partition:
+            raise ValueError(
+                "Aligned Decode PP requires decode.pp_layer_partition == "
+                "prefill.pp_layer_partition. "
+                f"Got decode={self._decode_pp_layer_partition!r}, "
+                f"prefill={self._prefill_pp_layer_partition!r}."
+            )
+
+    def _validate_decode_pp_process_config(self) -> None:
+        if self.kv_role != "kv_consumer" or self._decode_pp_size == 1:
+            return
+        if self.pp_size != self._decode_pp_size:
+            raise ValueError(
+                "Decode process --pipeline-parallel-size must match "
+                "decode.pp_size in kv_connector_extra_config for aligned D-PP. "
+                f"Got process pp_size={self.pp_size}, decode.pp_size={self._decode_pp_size}."
+            )
+
+    def _decode_pp_aligned(self) -> bool:
+        return self._decode_pp_size > 1
+
+    def _target_prefill_pp_ranks(self) -> list[int]:
+        """Prefill PP ranks this Decode worker should pull from."""
+        if self._decode_pp_aligned():
+            return [self.pp_rank]
+        return list(range(self._prefill_pp_size))
 
     @staticmethod
     def _serialize_kv_group_spec(
@@ -3214,7 +3259,7 @@ class MooncakeConnectorWorker:
                     f"decode tp size({self.tp_size})."
                 )
                 num_group_pulls = prefill_tp_size // self.tp_size
-                for pp_rank in range(self._prefill_pp_size):
+                for pp_rank in self._target_prefill_pp_ranks():
                     pp_rank_offset = pp_rank * prefill_tp_size
                     local_tp_offset = self.tp_rank * num_group_pulls
                     for remote_tp_offset in range(num_group_pulls):
@@ -3233,12 +3278,13 @@ class MooncakeConnectorWorker:
 
             num_group_pulls = self._get_attention_group_num_need_pulls(group_spec, prefill_tp_size)
             chosen_rank_list = self._get_attention_group_remote_rank(req_id, group_spec, prefill_tp_size)
-            assert len(chosen_rank_list) == num_group_pulls * self._prefill_pp_size, (
+            target_pp_ranks = self._target_prefill_pp_ranks()
+            assert len(chosen_rank_list) == num_group_pulls * len(target_pp_ranks), (
                 f"chosen_rank_list({chosen_rank_list}) does not match num_group_pulls({num_group_pulls}) "
-                f"and prefill pp size({self._prefill_pp_size})."
+                f"and target prefill pp ranks({target_pp_ranks})."
             )
             for rank_idx, remote_rank in enumerate(chosen_rank_list):
-                prefill_pp_rank = rank_idx // num_group_pulls
+                prefill_pp_rank = target_pp_ranks[rank_idx // num_group_pulls]
                 add_group_pull(
                     remote_rank,
                     GroupPull(
@@ -3524,7 +3570,11 @@ class MooncakeConnectorWorker:
                 f"Hybrid Mamba prefill tp size({self._prefill_tp_size}) must be divisible by "
                 f"decode tp size({self._decode_tp_size})."
             )
-            return set(range(self._prefill_tp_size * self._prefill_pp_size))
+            ranks: set[int] = set()
+            for pp_rank in self._target_prefill_pp_ranks():
+                pp_offset = pp_rank * self._prefill_tp_size
+                ranks.update(range(pp_offset, pp_offset + self._prefill_tp_size))
+            return ranks
 
         num_key_value_heads = self._get_attention_group_num_key_value_heads(group_spec)
         num_group_pulls = self._get_attention_group_num_need_pulls_for_decode_tp(
@@ -3592,11 +3642,12 @@ class MooncakeConnectorWorker:
             use_mla = self.vllm_config.model_config.is_deepseek_mla
 
         # Divide the ports according to the TP within the PP
+        target_pp_ranks = self._target_prefill_pp_ranks()
         sampled_nums = []
         if prefill_tp_size == self._decode_tp_size:
             sampled_nums = list(
                 map(
-                    lambda tp: [tp + pp * prefill_tp_size for pp in range(self._prefill_pp_size)],
+                    lambda tp: [tp + pp * prefill_tp_size for pp in target_pp_ranks],
                     range(prefill_tp_size),
                 )
             )
@@ -3623,12 +3674,12 @@ class MooncakeConnectorWorker:
                 tp_num_need_pulls,
                 use_mla,
             )
-            for pp_index in range(self._prefill_pp_size)
+            for pp_index in target_pp_ranks
         ]
         for group_index in range(len(all_results[0])):
             group = []
-            for pp_index in range(self._prefill_pp_size):
-                group.extend(all_results[pp_index][group_index])
+            for result_idx in range(len(all_results)):
+                group.extend(all_results[result_idx][group_index])
             sampled_nums.append(group)
         return sampled_nums
 
@@ -3749,6 +3800,8 @@ def ensure_zmq_recv(
 # decode node should know pp_partition_layer in prefill node,
 # it is configured in kv_transfer_config by partition_list_str,
 # default using vllm layer split algorithm.
+# When decode.pp_size > 1, it must match prefill.pp_size/partition (aligned D-PP);
+# each Decode PP rank pulls only from the same Prefill PP rank.
 def get_prefill_pp_indices(
     num_hidden_layers: int, pp_rank: int, pp_size: int, partition_list_str: str | None = None
 ) -> tuple[int, int]:

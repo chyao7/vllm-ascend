@@ -106,6 +106,21 @@ class RecomputeScheduler(Scheduler):
             and self.vllm_config.kv_transfer_config.is_kv_consumer
         )
         self.is_kv_producer = self.vllm_config.kv_transfer_config and self.vllm_config.kv_transfer_config.is_kv_producer
+        # Placeholder drafts exist only to match FULL decode cudagraph shapes on
+        # the first D-step after KV pull. With enforce-eager they are unnecessary
+        # and harmful: embedding sanitizes -1→0, writes bogus KV, then MTP
+        # rejection can accept/pollute context → garbled decode after a few tokens.
+        model_config = getattr(self.vllm_config, "model_config", None)
+        self._inject_mtp_kv_placeholders = bool(
+            self.is_mtp_kv_consumer and model_config is not None and not model_config.enforce_eager
+        )
+
+    def _maybe_fill_mtp_kv_placeholders(self, request: Request) -> None:
+        if not self._inject_mtp_kv_placeholders:
+            return
+        if self.max_model_len < (request.num_tokens + self.num_spec_tokens):
+            return
+        request.spec_token_ids = [PLACEHOLDER_TOKEN_ID] * self.num_spec_tokens
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
@@ -126,8 +141,7 @@ class RecomputeScheduler(Scheduler):
                 request.streaming_queue = deque()
             # Fill in placeholder tokens to enable full graph compatibility. Without
             # placeholders, graph matching may fail, forcing eager mode execution.
-            if self.is_mtp_kv_consumer and (self.max_model_len >= (request.num_tokens + self.num_spec_tokens)):
-                request.spec_token_ids = [PLACEHOLDER_TOKEN_ID] * self.num_spec_tokens
+            self._maybe_fill_mtp_kv_placeholders(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:
@@ -159,12 +173,11 @@ class RecomputeScheduler(Scheduler):
             request.num_computed_tokens = num_computed_tokens
 
             if (
-                self.is_mtp_kv_consumer
+                self._inject_mtp_kv_placeholders
                 and request.num_preemptions > 0
                 and not request.spec_token_ids
-                and self.max_model_len >= request.num_tokens + self.num_spec_tokens
             ):
-                request.spec_token_ids = [PLACEHOLDER_TOKEN_ID] * self.num_spec_tokens
+                self._maybe_fill_mtp_kv_placeholders(request)
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
 

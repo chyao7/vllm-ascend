@@ -515,5 +515,263 @@ class TestCorrectOptimisticSeqLensCpu(unittest.TestCase):
             runner._correct_optimistic_seq_lens_cpu(1)
 
 
+class TestPPAsyncMTPBroadcast(unittest.TestCase):
+    def _build_runner(self, *, num_spec_tokens: int = 2) -> NPUModelRunner:
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.device = torch.device("cpu")
+        runner.num_spec_tokens = num_spec_tokens
+        runner.use_async_scheduling = True
+        runner.use_async_spec_decode = num_spec_tokens > 0
+        runner.discard_request_mask = SimpleNamespace(
+            np=np.zeros(2, dtype=bool),
+        )
+        runner.input_batch = SimpleNamespace(
+            num_reqs=2,
+            req_ids=["r0", "r1"],
+            vocab_size=100000,
+            prev_sampled_token_ids=torch.tensor(
+                [[301], [302]], dtype=torch.int32, device=runner.device
+            ),
+            num_tokens_no_spec=np.array([5, 6], dtype=np.int32),
+            is_token_ids=np.zeros((2, 16), dtype=bool),
+            prev_req_id_to_index=None,
+        )
+        runner.requests = {
+            "r0": SimpleNamespace(output_token_ids=[]),
+            "r1": SimpleNamespace(output_token_ids=[]),
+        }
+        runner.drafter = MagicMock()
+        runner.drafter.prepare_next_token_ids_padded.return_value = (
+            torch.tensor([301, 302], dtype=torch.int32),
+            torch.tensor([2, 1], dtype=torch.int32),
+        )
+        runner.speculative_config = SimpleNamespace(
+            use_eagle=lambda: True,
+            uses_draft_model=lambda: False,
+            uses_extract_hidden_states=lambda: False,
+        )
+        runner.discard_request_indices = SimpleNamespace(
+            gpu=torch.tensor([], dtype=torch.int64),
+        )
+        runner.num_discarded_requests = 0
+        runner._draft_token_ids = torch.tensor(
+            [[11, 12], [21, 22]], dtype=torch.int32, device=runner.device
+        )
+        runner.valid_sampled_token_count_gpu = torch.tensor(
+            [2, 1], dtype=torch.int32, device=runner.device
+        )
+        runner.valid_sampled_token_count_event = None
+        runner.valid_sampled_token_count_cpu = torch.zeros(
+            2, dtype=torch.int64
+        )
+        runner._pp_reset_broadcast_next_token_cache()
+        return runner
+
+    @patch("vllm_ascend.worker.model_runner_v1.torch.npu.current_stream")
+    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+    def test_broadcast_async_token_state(self, mock_get_pp_group, mock_stream):
+        runner = self._build_runner()
+        mock_pp = MagicMock()
+        mock_pp.is_last_rank = True
+        mock_pp.rank_in_group = 1
+        mock_pp.world_size = 2
+        mock_get_pp_group.return_value = mock_pp
+        mock_stream.return_value.synchronize = MagicMock()
+        runner._pp_should_skip_token_broadcast = MagicMock(return_value=False)
+
+        sampled = torch.tensor([[101, 201, -1], [102, -1, -1]], dtype=torch.int32)
+        runner._pp_broadcast_async_token_state(sampled)
+
+        self.assertEqual(mock_pp.broadcast.call_count, 3)
+        next_ids = mock_pp.broadcast.call_args_list[0].args[0]
+        draft = mock_pp.broadcast.call_args_list[1].args[0]
+        count = mock_pp.broadcast.call_args_list[2].args[0]
+        self.assertEqual(next_ids.tolist(), [[301], [302]])
+        self.assertEqual(draft.tolist(), [[11, 12], [21, 22]])
+        self.assertEqual(count.tolist(), [2, 1])
+        for call in mock_pp.broadcast.call_args_list:
+            self.assertEqual(call.kwargs.get("src", call.args[1] if len(call.args) > 1 else None), 1)
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+    def test_receive_async_token_state(self, mock_get_pp_group):
+        runner = self._build_runner()
+        mock_pp = MagicMock()
+        mock_pp.is_last_rank = False
+        mock_pp.world_size = 2
+        mock_pp.last_rank = 3
+        mock_get_pp_group.return_value = mock_pp
+        runner._pp_should_skip_token_broadcast = MagicMock(return_value=False)
+        runner.valid_sampled_token_count_gpu = None
+        runner.input_batch.prev_sampled_token_ids = None
+        runner._draft_token_ids = None
+
+        payloads = [
+            torch.tensor([[301], [302]], dtype=torch.int32),
+            torch.tensor([[11, 12], [21, 22]], dtype=torch.int32),
+            torch.tensor([2, 1], dtype=torch.int32),
+        ]
+
+        def fake_broadcast(tensor, src):
+            tensor.copy_(payloads.pop(0))
+
+        mock_pp.broadcast.side_effect = fake_broadcast
+
+        runner._pp_receive_async_token_state()
+
+        self.assertEqual(
+            runner.input_batch.prev_sampled_token_ids.tolist(),
+            [[301], [302]],
+        )
+        self.assertEqual(runner._draft_token_ids.tolist(), [[11, 12], [21, 22]])
+        self.assertEqual(
+            runner.valid_sampled_token_count_gpu.tolist(), [2, 1]
+        )
+        self.assertEqual(
+            runner.valid_sampled_token_count_gpu.dtype, torch.int64
+        )
+        self.assertEqual(runner.input_batch.prev_req_id_to_index, {"r0": 0, "r1": 1})
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+    def test_receive_installs_valid_count_via_copy(self, mock_get_pp_group):
+        """PP0 must run _copy_valid_sampled_token_count so CPU seq_lens stay correct."""
+        runner = self._build_runner()
+        mock_pp = MagicMock()
+        mock_pp.is_last_rank = False
+        mock_pp.world_size = 2
+        mock_get_pp_group.return_value = mock_pp
+        runner._pp_should_skip_token_broadcast = MagicMock(return_value=False)
+        runner.valid_sampled_token_count_gpu = None
+        runner.input_batch.prev_sampled_token_ids = None
+        runner._draft_token_ids = None
+        runner._copy_valid_sampled_token_count = MagicMock(
+            wraps=runner._copy_valid_sampled_token_count
+        )
+
+        payloads = [
+            torch.tensor([[301], [302]], dtype=torch.int32),
+            torch.tensor([[11, 12], [21, 22]], dtype=torch.int32),
+            torch.tensor([2, 1], dtype=torch.int32),
+        ]
+
+        def fake_broadcast(tensor, src):
+            tensor.copy_(payloads.pop(0))
+
+        mock_pp.broadcast.side_effect = fake_broadcast
+        runner._pp_receive_async_token_state()
+
+        runner._copy_valid_sampled_token_count.assert_called_once()
+        next_ids, count = runner._copy_valid_sampled_token_count.call_args.args
+        self.assertEqual(next_ids.tolist(), [301, 302])
+        self.assertEqual(count.tolist(), [2, 1])
+        self.assertEqual(count.dtype, torch.int64)
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+    def test_prepare_input_ids_pp0_async_mtp_scatters_next_and_draft(
+        self, mock_get_pp_group
+    ):
+        """PP0: placeholders in schedule → scatter next+broadcast drafts."""
+        runner = self._build_runner()
+        mock_get_pp_group.return_value = SimpleNamespace(is_last_rank=False)
+        runner.pin_memory = False
+        runner.input_batch.prev_req_id_to_index = {"r0": 0, "r1": 1}
+        runner.input_batch.req_ids = ["r0", "r1"]
+        runner.prev_positions = SimpleNamespace(np=np.array([0, 1], dtype=np.int32))
+        runner.enable_prompt_embeds = False
+        gpu_ids = torch.full((6,), -1, dtype=torch.int32)
+        runner.input_ids = SimpleNamespace(
+            cpu=torch.full((6,), -1, dtype=torch.int32),
+            gpu=gpu_ids,
+            copy_to_gpu=MagicMock(),
+        )
+        runner._prepare_input_ids(
+            SimpleNamespace(
+                scheduled_spec_decode_tokens={
+                    "r0": [-1, -1],
+                    "r1": [-1, -1],
+                }
+            ),
+            num_reqs=2,
+            total_num_scheduled_tokens=6,
+            cu_num_tokens=np.array([3, 6], dtype=np.int32),
+        )
+        runner.input_ids.copy_to_gpu.assert_called_once_with(6)
+        # r0: sample@0 drafts@1,2 ; r1: sample@3 drafts@4,5
+        self.assertEqual(gpu_ids.tolist(), [301, 11, 12, 302, 21, 22])
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+    def test_prepare_input_ids_keeps_scheduled_drafts_when_real(
+        self, mock_get_pp_group
+    ):
+        """When scheduler already has real drafts, do not overwrite from broadcast."""
+        runner = self._build_runner()
+        mock_get_pp_group.return_value = SimpleNamespace(is_last_rank=False)
+        runner.pin_memory = False
+        runner.input_batch.prev_req_id_to_index = {"r0": 0, "r1": 1}
+        runner.input_batch.req_ids = ["r0", "r1"]
+        runner.prev_positions = SimpleNamespace(np=np.array([0, 1], dtype=np.int32))
+        runner.enable_prompt_embeds = False
+        # Simulate copy_to_gpu having uploaded scheduled drafts 91/92, 93/94.
+        gpu_ids = torch.tensor([0, 91, 92, 0, 93, 94], dtype=torch.int32)
+
+        def fake_copy_to_gpu(n):
+            pass
+
+        runner.input_ids = SimpleNamespace(
+            cpu=torch.tensor([0, 91, 92, 0, 93, 94], dtype=torch.int32),
+            gpu=gpu_ids,
+            copy_to_gpu=MagicMock(side_effect=fake_copy_to_gpu),
+        )
+        runner._prepare_input_ids(
+            SimpleNamespace(
+                scheduled_spec_decode_tokens={
+                    "r0": [91, 92],
+                    "r1": [93, 94],
+                }
+            ),
+            num_reqs=2,
+            total_num_scheduled_tokens=6,
+            cu_num_tokens=np.array([3, 6], dtype=np.int32),
+        )
+        # next tokens from broadcast; drafts kept from scheduler (not 11/12/21/22)
+        self.assertEqual(gpu_ids.tolist(), [301, 91, 92, 302, 93, 94])
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+    def test_prepare_input_ids_handles_prev_batch_larger_than_current(
+        self, mock_get_pp_group
+    ):
+        """High concurrency: prev broadcast may have more rows than current batch."""
+        runner = self._build_runner()
+        mock_get_pp_group.return_value = SimpleNamespace(is_last_rank=False)
+        runner.pin_memory = False
+        runner.input_batch.num_reqs = 2
+        runner.input_batch.req_ids = ["r0", "r2"]
+        runner.input_batch.prev_req_id_to_index = {"r0": 0, "r1": 1, "r2": 2}
+        runner.input_batch.prev_sampled_token_ids = torch.tensor(
+            [[301], [302], [303]], dtype=torch.int32
+        )
+        runner._draft_token_ids = torch.tensor(
+            [[11, 12], [21, 22], [31, 32]], dtype=torch.int32
+        )
+        runner.prev_positions = SimpleNamespace(np=np.array([0, 2], dtype=np.int32))
+        runner.enable_prompt_embeds = False
+        gpu_ids = torch.full((6,), -1, dtype=torch.int32)
+        runner.input_ids = SimpleNamespace(
+            cpu=torch.full((6,), -1, dtype=torch.int32),
+            gpu=gpu_ids,
+            copy_to_gpu=MagicMock(),
+        )
+        runner._prepare_input_ids(
+            SimpleNamespace(
+                scheduled_spec_decode_tokens={
+                    "r0": [-1, -1],
+                    "r2": [-1, -1],
+                }
+            ),
+            num_reqs=2,
+            total_num_scheduled_tokens=6,
+            cu_num_tokens=np.array([3, 6], dtype=np.int32),
+        )
+        self.assertEqual(gpu_ids.tolist(), [301, 11, 12, 303, 31, 32])
+
 if __name__ == "__main__":
     unittest.main()

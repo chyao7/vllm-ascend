@@ -839,14 +839,13 @@ class TestNPUPlatform(TestBase):
 
         self.platform._validate_pd_pp_mtp_config(vllm_config)
 
-    def test_validate_pd_pp_mtp_config_rejects_decode_pp_mtp(self):
+    def test_validate_pd_pp_mtp_config_accepts_decode_pp_mtp(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
         vllm_config.speculative_config = MagicMock(method="mtp")
         vllm_config.parallel_config.pipeline_parallel_size = 2
         vllm_config.kv_transfer_config = MagicMock(is_kv_producer=False, kv_role="kv_consumer")
 
-        with pytest.raises(ValueError, match=r"PP\+MTP.*P nodes.*D nodes.*pipeline_parallel_size=1"):
-            self.platform._validate_pd_pp_mtp_config(vllm_config)
+        self.platform._validate_pd_pp_mtp_config(vllm_config)
 
     def test_validate_pd_pp_mtp_config_rejects_non_pd_pp_mtp(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
@@ -854,7 +853,7 @@ class TestNPUPlatform(TestBase):
         vllm_config.parallel_config.pipeline_parallel_size = 2
         vllm_config.kv_transfer_config = None
 
-        with pytest.raises(ValueError, match=r"PP\+MTP.*PD-disaggregated P nodes"):
+        with pytest.raises(ValueError, match=r"PP\+MTP.*PD-disaggregated"):
             self.platform._validate_pd_pp_mtp_config(vllm_config)
 
     def test_validate_pd_pp_mtp_config_allows_non_mtp_spec_decode(self):

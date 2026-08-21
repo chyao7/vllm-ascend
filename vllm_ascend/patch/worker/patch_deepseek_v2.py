@@ -24,6 +24,61 @@ from vllm.model_executor.models.deepseek_v2 import (
 from vllm.model_executor.models.utils import extract_layer_index
 
 
+def _would_skip_topk(
+    layer_id: int,
+    index_topk_freq: int,
+    index_skip_topk_offset: int,
+    index_topk_pattern: list | None,
+) -> bool:
+    if index_topk_pattern is None:
+        return (
+            max(layer_id - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
+        )
+    if 0 <= layer_id < len(index_topk_pattern):
+        return index_topk_pattern[layer_id] == "S"
+    return False
+
+
+def _force_topk_recompute_at_pp_boundary(
+    layer_id: int,
+    config: DeepseekV2Config | DeepseekV3Config,
+    index_topk_freq: int,
+    index_skip_topk_offset: int,
+    index_topk_pattern: list | None,
+) -> bool:
+    """IndexCache topk buffer is process-local; PP stages cannot reuse a donor
+    layer that lives on another rank. Force recompute on the leading skip
+    layers of each PP stage (e.g. layers 31-32 with PP=[0,31)/[31,61)).
+    """
+    if not _would_skip_topk(
+        layer_id, index_topk_freq, index_skip_topk_offset, index_topk_pattern
+    ):
+        return False
+    num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    if not num_hidden_layers:
+        return False
+    try:
+        from vllm.distributed import get_pp_group
+        from vllm.distributed.utils import get_pp_indices
+
+        pp = get_pp_group()
+        if pp.world_size <= 1:
+            return False
+        start_layer, _ = get_pp_indices(
+            num_hidden_layers, pp.rank_in_group, pp.world_size
+        )
+    except Exception:
+        return False
+    if layer_id < start_layer:
+        return False
+    for donor in range(start_layer, layer_id):
+        if not _would_skip_topk(
+            donor, index_topk_freq, index_skip_topk_offset, index_topk_pattern
+        ):
+            return False
+    return True
+
+
 def _should_skip_indexer_init(
     config: DeepseekV2Config | DeepseekV3Config,
     prefix: str,
@@ -203,17 +258,22 @@ def _deepseek_v2_mla_attention_init(
 
     layer_id = extract_layer_index(prefix)
 
-    if _index_topk_pattern is None:
-        _skip_topk = (
-            max(
-                layer_id - _index_skip_topk_offset + 1,
-                0,
-            )
-            % _index_topk_freq
-            != 0
-        )
-    elif 0 <= layer_id < len(_index_topk_pattern):
-        _skip_topk = _index_topk_pattern[layer_id] == "S"
+    _skip_topk = _would_skip_topk(
+        layer_id,
+        _index_topk_freq,
+        _index_skip_topk_offset,
+        _index_topk_pattern,
+    )
+    # PP stages do not share topk_indices_buffer; never skip until a donor
+    # layer on *this* rank has written the buffer in the same forward.
+    if _force_topk_recompute_at_pp_boundary(
+        layer_id,
+        config,
+        _index_topk_freq,
+        _index_skip_topk_offset,
+        _index_topk_pattern,
+    ):
+        _skip_topk = False
 
     skip_indexer_init = _should_skip_indexer_init(config, prefix, _skip_topk)
     if self.is_v32 and not skip_indexer_init:

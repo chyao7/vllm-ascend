@@ -2201,6 +2201,42 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertListEqual(get_tp_rank(8, 1, 2, 4, 2, False, 4), get_tp_rank(4, 1, 2, 4, 2, False))
         self.assertListEqual(get_tp_rank(4, 1, 2, 4, 1, False, 2), get_tp_rank(2, 1, 2, 4, 1, False))
 
+    def test_aligned_decode_pp_rejects_mismatched_pp_size(self):
+        self.vllm_config.kv_transfer_config.kv_role = "kv_consumer"
+        self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = lambda k, d=None: {
+            "prefill": {"tp_size": 2, "dp_size": 1, "pp_size": 2},
+            "decode": {"tp_size": 2, "dp_size": 1, "pp_size": 4},
+        }.get(k, d)
+        with self.assertRaisesRegex(ValueError, "decode.pp_size == prefill.pp_size"):
+            MooncakeConnectorWorker(self.vllm_config, self.engine_id, MockKVCacheConfig())
+
+    def test_aligned_decode_pp_rejects_mismatched_partition(self):
+        self.vllm_config.kv_transfer_config.kv_role = "kv_consumer"
+        self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = lambda k, d=None: {
+            "prefill": {"tp_size": 2, "dp_size": 1, "pp_size": 2, "pp_layer_partition": "16,16"},
+            "decode": {"tp_size": 2, "dp_size": 1, "pp_size": 2, "pp_layer_partition": "20,12"},
+        }.get(k, d)
+        with self.assertRaisesRegex(ValueError, "pp_layer_partition"):
+            MooncakeConnectorWorker(self.vllm_config, self.engine_id, MockKVCacheConfig())
+
+    def test_aligned_decode_pp_pulls_only_matching_stage(self):
+        self.vllm_config.kv_transfer_config.kv_role = "kv_consumer"
+        self.vllm_config.parallel_config.pipeline_parallel_size = 2
+        self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = lambda k, d=None: {
+            "prefill": {"tp_size": 2, "dp_size": 1, "pp_size": 2},
+            "decode": {"tp_size": 2, "dp_size": 1, "pp_size": 2},
+        }.get(k, d)
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_pp_group",
+            return_value=MagicMock(rank_in_group=1, world_size=2),
+        ):
+            worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id, MockKVCacheConfig())
+        self.assertTrue(worker._decode_pp_aligned())
+        self.assertEqual(worker._target_prefill_pp_ranks(), [1])
+        ranks = worker._get_remote_ranks_for_req("test")
+        # decode_tp == prefill_tp == 2, only PP rank 1 ranks: 2 and 3
+        self.assertEqual(ranks, [[2], [3]])
+
     def test_get_kv_split_metadata(self):
         def get_kv_split_metadata(
             use_mla,
