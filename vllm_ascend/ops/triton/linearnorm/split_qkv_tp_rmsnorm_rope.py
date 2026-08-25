@@ -275,12 +275,12 @@ def _split_qkv_cache_v_and_compute_local_qk_var_kernel(
     qkv_stride: tl.constexpr,
     q_inv_size: tl.constexpr,
     k_inv_size: tl.constexpr,
-    block_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Variant of kernel1 that scatters V straight into the paged KV cache
-    (ND layout [num_blocks, block_size, num_kv_heads, head_dim], row stride
-    equals k_cols), removing the separate reshape_and_cache pass for V.
+    """Variant of kernel1 that scatters V straight into the paged KV cache,
+    removing the separate reshape_and_cache pass for V. The ND cache
+    [num_blocks, block_size, num_kv_heads, head_dim] is addressed as flat
+    rows of k_cols elements, so slot_mapping is already the row index.
     slot_mapping < 0 marks padding tokens whose cache write is skipped."""
     pid = tl.program_id(0)
     num_pids = tl.num_programs(0)
@@ -327,9 +327,8 @@ def _split_qkv_cache_v_and_compute_local_qk_var_kernel(
         tl.store(k_out_ptr + token_indices[:, None] * k_cols + k_offset, k_batch, mask=k_mask)
 
         slots = tl.load(slot_mapping_ptr + token_indices, mask=row_valid, other=-1).to(tl.int64)
-        v_base = (slots // block_size) * (block_size * k_cols) + (slots % block_size) * k_cols
         v_cache_mask = token_mask & (v_offset < k_cols) & (slots >= 0)[:, None]
-        tl.store(v_cache_ptr + v_base[:, None] + v_offset, v_batch, mask=v_cache_mask)
+        tl.store(v_cache_ptr + slots[:, None] * k_cols + v_offset, v_batch, mask=v_cache_mask)
 
         var_offset = token_indices * 2
         tl.store(qk_var_ptr + var_offset, q_squaresum, mask=row_valid)
@@ -358,10 +357,10 @@ def _apply_global_rmsnorm_cache_k_kernel(
     head_dim: tl.constexpr,
     rotary_dim: tl.constexpr,
     HALF: tl.constexpr,
-    block_size: tl.constexpr,
 ):
     """Variant of kernel2 that scatters the normed+roped K straight into the
-    paged KV cache instead of writing it back to a contiguous buffer."""
+    paged KV cache (flat rows of k_cols elements indexed by slot_mapping)
+    instead of writing it back to a contiguous buffer."""
     pid = tl.program_id(0).to(tl.int64)
     num_programs = tl.num_programs(0)
     tokens_per_program = tl.cdiv(num_tokens, num_programs)
@@ -464,8 +463,7 @@ def _apply_global_rmsnorm_cache_k_kernel(
             strides=(1, 1, 1),
         )
         slot = tl.load(slot_mapping_ptr + token_offsets, mask=token_mask, other=-1).to(tl.int64)
-        k_base = (slot // block_size) * (block_size * k_cols) + (slot % block_size) * k_cols
-        k_cache_offsets = k_base[:, None, None] + k_row_offsets[None, :, :]
+        k_cache_offsets = slot[:, None, None] * k_cols + k_row_offsets[None, :, :]
         k_store_mask = token_mask[:, None, None] & (slot >= 0)[:, None, None]
         tl.store(k_cache_ptr + k_cache_offsets, k_vals.to(k_vals_raw.dtype), mask=k_store_mask)
 
@@ -602,16 +600,16 @@ def split_qkv_tp_rmsnorm_rope_cache_impl(
     v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
 ) -> torch.Tensor:
-    """Fused variant that writes K/V directly into the paged KV cache
-    (ND layout [num_blocks, block_size, num_kv_heads, head_dim]),
-    eliminating the separate reshape_and_cache kernel. Returns q only."""
+    """Fused variant that writes K/V directly into the paged KV cache,
+    eliminating the separate reshape_and_cache kernel. Returns q only.
+    The ND cache [num_blocks, block_size, num_kv_heads, head_dim] is
+    addressed as flat rows of kv_hidden_size elements via slot_mapping."""
     num_tokens = input.shape[0]
     input_2d = input.view(num_tokens, -1)
     q = torch.empty(num_tokens, q_hidden_size, device=input.device, dtype=input.dtype)
     if num_tokens == 0:
         return q
 
-    block_size = k_cache.shape[1]
     num_vectorcore = get_vectorcore_num()
     grid = (min(num_tokens, num_vectorcore),)
     q_cols = q_hidden_size
@@ -640,7 +638,6 @@ def split_qkv_tp_rmsnorm_rope_cache_impl(
         q_cols + 2 * k_cols,
         q_inv_size,
         k_inv_size,
-        block_size,
     )
     if tp_world > 1:
         qk_var = tensor_model_parallel_all_reduce(qk_var)
@@ -670,7 +667,6 @@ def split_qkv_tp_rmsnorm_rope_cache_impl(
         head_dim,
         rotary_dim,
         rotary_dim // 2,
-        block_size,
     )
 
     return q
