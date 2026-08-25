@@ -83,8 +83,8 @@ def run_case(tp, q_heads, kv_heads, num_tokens):
             sin=sin,
         )
         torch_npu.npu_scatter_pa_kv_cache(
-            key=k.contiguous(),
-            value=v.contiguous(),
+            key=k.view(num_tokens, kv_heads, HEAD_DIM),
+            value=v.view(num_tokens, kv_heads, HEAD_DIM),
             key_cache=k_cache_legacy,
             value_cache=v_cache_legacy,
             slot_mapping=slot_mapping,
@@ -123,8 +123,8 @@ def run_case(tp, q_heads, kv_heads, num_tokens):
     t_legacy = bench_us(legacy)
     t_scatter = bench_us(
         lambda: torch_npu.npu_scatter_pa_kv_cache(
-            key=torch.empty(num_tokens, k_cols, dtype=DTYPE, device=device),
-            value=torch.empty(num_tokens, k_cols, dtype=DTYPE, device=device),
+            key=torch.empty(num_tokens, kv_heads, HEAD_DIM, dtype=DTYPE, device=device),
+            value=torch.empty(num_tokens, kv_heads, HEAD_DIM, dtype=DTYPE, device=device),
             key_cache=k_cache_legacy,
             value_cache=v_cache_legacy,
             slot_mapping=slot_mapping,
