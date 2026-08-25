@@ -130,9 +130,24 @@ def run_shape(tp_world, num_q_heads, num_kv_heads, num_tokens):
 
     native_us = bench_us(run_native)
 
+    # Baselines to decompose full_op's host overhead: one CANN op launch,
+    # and the 4 tensor allocations (q/k/v + qk_var) inside the custom op.
+    def run_cann_1op():
+        torch.ops.npu.npu_rms_norm(q, q_weight_npu, EPS)
+
+    cann_1op_us = bench_us(run_cann_1op)
+
+    def run_empty4():
+        torch.empty(num_tokens, q_cols, dtype=DTYPE, device=device)
+        torch.empty(num_tokens, k_cols, dtype=DTYPE, device=device)
+        torch.empty(num_tokens, k_cols, dtype=DTYPE, device=device)
+        torch.empty(num_tokens, 2, dtype=torch.float32, device=device)
+
+    empty4_us = bench_us(run_empty4)
+
     moved_bytes = num_tokens * (2 * (q_cols + k_cols) * q.element_size() + ROTARY_DIM * q.element_size() + 8)
     bw_gbps = moved_bytes / (kernel2_us * 1e-6) / 1e9
-    return kernel2_us, full_op_us, native_us, bw_gbps
+    return kernel2_us, full_op_us, native_us, cann_1op_us, empty4_us, bw_gbps
 
 
 def main():
@@ -140,14 +155,20 @@ def main():
     init_device_properties_triton()
     print(f"vectorcore num: {get_vectorcore_num()}")
     header = (
-        f"{'tp':>3} {'tokens':>6} {'kernel2(us)':>12} {'full_op(us)':>12} {'native(us)':>11} {'kernel2 GB/s':>13}"
+        f"{'tp':>3} {'tokens':>6} {'kernel2(us)':>12} {'full_op(us)':>12} {'native(us)':>11}"
+        f" {'cann1op(us)':>12} {'empty4(us)':>11} {'kernel2 GB/s':>13}"
     )
     print(header)
     print("-" * len(header))
     for tp_world, (num_q_heads, num_kv_heads) in TP_SHAPES.items():
         for num_tokens in NUM_TOKENS_LIST:
-            kernel2_us, full_op_us, native_us, bw_gbps = run_shape(tp_world, num_q_heads, num_kv_heads, num_tokens)
-            print(f"{tp_world:>3} {num_tokens:>6} {kernel2_us:>12.1f} {full_op_us:>12.1f} {native_us:>11.1f} {bw_gbps:>13.0f}")
+            kernel2_us, full_op_us, native_us, cann_1op_us, empty4_us, bw_gbps = run_shape(
+                tp_world, num_q_heads, num_kv_heads, num_tokens
+            )
+            print(
+                f"{tp_world:>3} {num_tokens:>6} {kernel2_us:>12.1f} {full_op_us:>12.1f} {native_us:>11.1f}"
+                f" {cann_1op_us:>12.1f} {empty4_us:>11.1f} {bw_gbps:>13.0f}"
+            )
 
 
 if __name__ == "__main__":
