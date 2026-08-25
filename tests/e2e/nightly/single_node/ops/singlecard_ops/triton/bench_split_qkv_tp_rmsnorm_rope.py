@@ -3,9 +3,11 @@
 # Not collected by pytest (bench_ prefix). Run directly on an NPU machine:
 #   python tests/e2e/nightly/single_node/ops/singlecard_ops/triton/bench_split_qkv_tp_rmsnorm_rope.py
 #
-# Measures:
+# Measures three paths:
 #   1. kernel2 (_apply_global_rmsnorm_kernel) alone
-#   2. the full split_qkv_tp_rmsnorm_rope custom op (kernel1 + kernel2) for reference
+#   2. the full split_qkv_tp_rmsnorm_rope custom op (kernel1 + kernel2)
+#   3. native CANN ops: split + npu_rms_norm + npu_rotary_mul + cat
+#      (equivalent to the tp_world=1 math of the fused op)
 # Reports per-call latency and effective HBM bandwidth of kernel2.
 
 import torch
@@ -108,22 +110,43 @@ def run_shape(tp_world, num_q_heads, num_kv_heads, num_tokens):
 
     full_op_us = bench_us(run_full_op)
 
+    # Native CANN path: split + rms_norm (full-hidden, tp_world=1) + rotary_mul + cat.
+    q_weight_npu = torch.randn(q_cols, dtype=DTYPE, device=device)
+    k_weight_npu = torch.randn(k_cols, dtype=DTYPE, device=device)
+    cos_full = torch.cat((cos_half, cos_half), dim=-1).reshape(1, num_tokens, 1, ROTARY_DIM).contiguous()
+    sin_full = torch.cat((sin_half, sin_half), dim=-1).reshape(1, num_tokens, 1, ROTARY_DIM).contiguous()
+
+    def run_native():
+        qn, kn, _ = torch.split(qkv, [q_cols, k_cols, k_cols], dim=-1)
+        qn, _ = torch.ops.npu.npu_rms_norm(qn, q_weight_npu, EPS)
+        kn, _ = torch.ops.npu.npu_rms_norm(kn, k_weight_npu, EPS)
+        q3 = qn.view(num_tokens, num_q_heads, HEAD_DIM)
+        k3 = kn.view(num_tokens, num_kv_heads, HEAD_DIM)
+        q_rot = torch_npu.npu_rotary_mul(q3[..., :ROTARY_DIM], cos_full, sin_full)
+        k_rot = torch_npu.npu_rotary_mul(k3[..., :ROTARY_DIM], cos_full, sin_full)
+        torch.cat((q_rot, q3[..., ROTARY_DIM:]), dim=-1)
+        torch.cat((k_rot, k3[..., ROTARY_DIM:]), dim=-1)
+
+    native_us = bench_us(run_native)
+
     moved_bytes = num_tokens * (2 * (q_cols + k_cols) * q.element_size() + ROTARY_DIM * q.element_size() + 8)
     bw_gbps = moved_bytes / (kernel2_us * 1e-6) / 1e9
-    return kernel2_us, full_op_us, bw_gbps
+    return kernel2_us, full_op_us, native_us, bw_gbps
 
 
 def main():
     torch.manual_seed(0)
     init_device_properties_triton()
     print(f"vectorcore num: {get_vectorcore_num()}")
-    header = f"{'tp':>3} {'tokens':>6} {'kernel2(us)':>12} {'full_op(us)':>12} {'kernel2 GB/s':>13}"
+    header = (
+        f"{'tp':>3} {'tokens':>6} {'kernel2(us)':>12} {'full_op(us)':>12} {'native(us)':>11} {'kernel2 GB/s':>13}"
+    )
     print(header)
     print("-" * len(header))
     for tp_world, (num_q_heads, num_kv_heads) in TP_SHAPES.items():
         for num_tokens in NUM_TOKENS_LIST:
-            kernel2_us, full_op_us, bw_gbps = run_shape(tp_world, num_q_heads, num_kv_heads, num_tokens)
-            print(f"{tp_world:>3} {num_tokens:>6} {kernel2_us:>12.1f} {full_op_us:>12.1f} {bw_gbps:>13.0f}")
+            kernel2_us, full_op_us, native_us, bw_gbps = run_shape(tp_world, num_q_heads, num_kv_heads, num_tokens)
+            print(f"{tp_world:>3} {num_tokens:>6} {kernel2_us:>12.1f} {full_op_us:>12.1f} {native_us:>11.1f} {bw_gbps:>13.0f}")
 
 
 if __name__ == "__main__":
