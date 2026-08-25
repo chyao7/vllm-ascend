@@ -32,7 +32,9 @@ ROTARY_DIM = 64
 HALF = ROTARY_DIM // 2
 WARMUP_ITERS = 10
 BENCH_ITERS = 50
-BLOCK_T_CANDIDATES = [1, 2, 4, 8]
+# bt=1 is omitted: the single-token 2D specialization is pathologically slow
+# (scalarized), and the legacy kernel already covers the BLOCK_T=1 baseline.
+BLOCK_T_CANDIDATES = [2, 4, 8]
 
 # MiniMax-M2.5: 48 q heads, 8 kv heads. Local heads per TP rank:
 #   TP=4 -> 12 q + 2 kv;  TP=8 -> 6 q + 1 kv
