@@ -125,6 +125,16 @@ def _split_qkv_and_compute_local_qk_var_kernel(
         tl.store(qk_var_ptr + var_offset + 1, k_squaresum, mask=var_mask)
 
 
+# BLOCK_T is autotuned over {1,2,4} (same UB-overflow concern as kernel1:
+# the q tile is BLOCK_T * q_num_heads * head_dim fp32).
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_T": 1}),
+        triton.Config({"BLOCK_T": 2}),
+        triton.Config({"BLOCK_T": 4}),
+    ],
+    key=["q_cols", "k_cols"],
+)
 @triton.jit
 def _apply_global_rmsnorm_kernel(
     q_ptr,
@@ -145,15 +155,15 @@ def _apply_global_rmsnorm_kernel(
     head_dim: tl.constexpr,
     rotary_dim: tl.constexpr,
     HALF: tl.constexpr,
+    BLOCK_T: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
     num_programs = tl.num_programs(0)
     tokens_per_program = tl.cdiv(num_tokens, num_programs)
-    iter_num_per_program = tokens_per_program
     program_token_offset = pid * tokens_per_program
     program_token_end = min(program_token_offset + tokens_per_program, num_tokens)
 
-    token_tile_offsets = tl.arange(0, 1)
+    token_tile_offsets = tl.arange(0, BLOCK_T)
     q_head_offsets = tl.arange(0, q_num_heads)[:, None]
     k_head_offsets = tl.arange(0, k_num_heads)[:, None]
     hd_offsets = tl.arange(0, head_dim)[None, :]
@@ -165,10 +175,10 @@ def _apply_global_rmsnorm_kernel(
     k_weight = tl.load(k_weight_ptr + k_row_offsets).to(tl.float32)
 
     half_offsets = tl.arange(0, HALF)
-    base_token_offsets = program_token_offset + token_tile_offsets
 
-    for iter in tl.range(iter_num_per_program):
-        token_offsets = base_token_offsets + iter
+    num_tiles = tl.cdiv(tokens_per_program, BLOCK_T)
+    for tile_iter in tl.range(num_tiles):
+        token_offsets = program_token_offset + tile_iter * BLOCK_T + token_tile_offsets
         token_mask = token_offsets < program_token_end
 
         q_gv = tl.load(qk_global_var_ptr + token_offsets * 2, mask=token_mask, other=0.0).to(tl.float32)
@@ -197,27 +207,27 @@ def _apply_global_rmsnorm_kernel(
         q1 = extract_slice(
             q_vals,
             offsets=(0, 0, 0),
-            sizes=(1, q_num_heads, HALF),
+            sizes=(BLOCK_T, q_num_heads, HALF),
             strides=(1, 1, 1),
         )
         q2 = extract_slice(
             q_vals,
             offsets=(0, 0, HALF),
-            sizes=(1, q_num_heads, HALF),
+            sizes=(BLOCK_T, q_num_heads, HALF),
             strides=(1, 1, 1),
         )
         q_vals = insert_slice(
             q_vals,
             q1 * cos_row[:, None, :] - q2 * sin_row[:, None, :],
             offsets=(0, 0, 0),
-            sizes=(1, q_num_heads, HALF),
+            sizes=(BLOCK_T, q_num_heads, HALF),
             strides=(1, 1, 1),
         )
         q_vals = insert_slice(
             q_vals,
             q2 * cos_row[:, None, :] + q1 * sin_row[:, None, :],
             offsets=(0, 0, HALF),
-            sizes=(1, q_num_heads, HALF),
+            sizes=(BLOCK_T, q_num_heads, HALF),
             strides=(1, 1, 1),
         )
         tl.store(q_ptr + q_offsets, q_vals.to(q_vals_raw.dtype), mask=q_mask)
@@ -225,27 +235,27 @@ def _apply_global_rmsnorm_kernel(
         k1 = extract_slice(
             k_vals,
             offsets=(0, 0, 0),
-            sizes=(1, k_num_heads, HALF),
+            sizes=(BLOCK_T, k_num_heads, HALF),
             strides=(1, 1, 1),
         )
         k2 = extract_slice(
             k_vals,
             offsets=(0, 0, HALF),
-            sizes=(1, k_num_heads, HALF),
+            sizes=(BLOCK_T, k_num_heads, HALF),
             strides=(1, 1, 1),
         )
         k_vals = insert_slice(
             k_vals,
             k1 * cos_row[:, None, :] - k2 * sin_row[:, None, :],
             offsets=(0, 0, 0),
-            sizes=(1, k_num_heads, HALF),
+            sizes=(BLOCK_T, k_num_heads, HALF),
             strides=(1, 1, 1),
         )
         k_vals = insert_slice(
             k_vals,
             k2 * cos_row[:, None, :] + k1 * sin_row[:, None, :],
             offsets=(0, 0, HALF),
-            sizes=(1, k_num_heads, HALF),
+            sizes=(BLOCK_T, k_num_heads, HALF),
             strides=(1, 1, 1),
         )
         tl.store(k_ptr + k_offsets, k_vals.to(k_vals_raw.dtype), mask=k_mask)
