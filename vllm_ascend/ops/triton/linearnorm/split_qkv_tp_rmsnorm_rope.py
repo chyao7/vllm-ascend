@@ -327,8 +327,18 @@ def _split_qkv_cache_v_and_compute_local_qk_var_kernel(
         tl.store(k_out_ptr + token_indices[:, None] * k_cols + k_offset, k_batch, mask=k_mask)
 
         slots = tl.load(slot_mapping_ptr + token_indices, mask=row_valid, other=-1).to(tl.int64)
-        v_cache_mask = token_mask & (v_offset < k_cols) & (slots >= 0)[:, None]
-        tl.store(v_cache_ptr + slots[:, None] * k_cols + v_offset, v_batch, mask=v_cache_mask)
+        # Keep the store mask row-level: composite row*col masks get
+        # scalarized by the Ascend backend. M2.5 kv rows are powers of two
+        # (128/256), so the column range needs no mask on those shapes.
+        write_v = row_valid & (slots >= 0)
+        if k_cols_pow2 == k_cols:
+            tl.store(v_cache_ptr + slots[:, None] * k_cols + v_offset, v_batch, mask=write_v[:, None])
+        else:
+            tl.store(
+                v_cache_ptr + slots[:, None] * k_cols + v_offset,
+                v_batch,
+                mask=write_v[:, None] & (v_offset < k_cols),
+            )
 
         var_offset = token_indices * 2
         tl.store(qk_var_ptr + var_offset, q_squaresum, mask=row_valid)
@@ -464,8 +474,9 @@ def _apply_global_rmsnorm_cache_k_kernel(
         )
         slot = tl.load(slot_mapping_ptr + token_offsets, mask=token_mask, other=-1).to(tl.int64)
         k_cache_offsets = slot[:, None, None] * k_cols + k_row_offsets[None, :, :]
-        k_store_mask = token_mask[:, None, None] & (slot >= 0)[:, None, None]
-        tl.store(k_cache_ptr + k_cache_offsets, k_vals.to(k_vals_raw.dtype), mask=k_store_mask)
+        # Row-level mask only, same scalarization concern as the V store.
+        write_k = token_mask & (slot >= 0)
+        tl.store(k_cache_ptr + k_cache_offsets, k_vals.to(k_vals_raw.dtype), mask=write_k[:, None, None])
 
 
 def split_qkv_tp_rmsnorm_rope_impl(
