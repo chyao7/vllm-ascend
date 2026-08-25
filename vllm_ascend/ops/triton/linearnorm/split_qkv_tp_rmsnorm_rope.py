@@ -22,7 +22,7 @@ from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from vllm_ascend.ops.triton.triton_utils import extract_slice, get_vectorcore_num, insert_slice
+from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
 
 # TODO: UB size differs across chips; consider whether BLOCK_SIZE can
@@ -128,9 +128,11 @@ def _split_qkv_and_compute_local_qk_var_kernel(
 # Token tile size for _apply_global_rmsnorm_kernel. Measured on Ascend 910B
 # with MiniMax-M2.5 shapes (TP4: 12q+2kv heads, TP8: 6q+1kv): BLOCK_T=4 gives
 # ~1.5x over the single-token version at 16K tokens and ties at small token
-# counts; BLOCK_T=8 overflows UB at TP4. The kernel uses a 2D
-# (token*head, head_dim) tile layout because the CANN Triton backend
-# mis-plans UB for 3D extract_slice/insert_slice with constexpr sizes.
+# counts. Each head is processed as three plain 3D segments (the two rotary
+# halves and the pass-through tail) instead of extract_slice/insert_slice on
+# a flattened (token*head) row encoding: the CANN Triton backend mis-plans UB
+# for constexpr-size 3D slices, and scalarizes masked loads/stores when the
+# mask is combined with a %//-encoded row-validity term.
 _APPLY_GLOBAL_RMSNORM_BLOCK_T = 4
 
 
@@ -155,8 +157,6 @@ def _apply_global_rmsnorm_kernel(
     rotary_dim: tl.constexpr,
     HALF: tl.constexpr,
     BLOCK_T: tl.constexpr,
-    q_rows_pow2: tl.constexpr,
-    k_rows_pow2: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
     num_programs = tl.num_programs(0)
@@ -164,94 +164,68 @@ def _apply_global_rmsnorm_kernel(
     program_token_offset = pid * tokens_per_program
     program_token_end = min(program_token_offset + tokens_per_program, num_tokens)
 
-    # Rows are (token, head) pairs: row = local_token * num_heads + head.
-    # tl.arange requires a power-of-2 length on the Ascend Triton backend
-    # (same constraint as kernel1), so row ranges are padded and masked.
-    q_rows: tl.constexpr = BLOCK_T * q_num_heads
-    k_rows: tl.constexpr = BLOCK_T * k_num_heads
+    token_tile = tl.arange(0, BLOCK_T)
+    q_heads = tl.arange(0, q_num_heads)
+    k_heads = tl.arange(0, k_num_heads)
+    half_offsets = tl.arange(0, HALF)
+    PASS: tl.constexpr = head_dim - rotary_dim
 
-    q_row_arange = tl.arange(0, q_rows_pow2)
-    q_row_valid = q_row_arange < q_rows
-    q_head_in_row = q_row_arange % q_num_heads
-    q_tok_in_tile = q_row_arange // q_num_heads
-    k_row_arange = tl.arange(0, k_rows_pow2)
-    k_row_valid = k_row_arange < k_rows
-    k_head_in_row = k_row_arange % k_num_heads
-    k_tok_in_tile = k_row_arange // k_num_heads
-
-    hd_offsets = tl.arange(0, head_dim)[None, :]
-    half_offsets = tl.arange(0, HALF)[None, :]
-
-    # weight broadcast per row: [rows, head_dim]
-    q_weight = tl.load(q_weight_ptr + q_head_in_row[:, None] * head_dim + hd_offsets).to(tl.float32)
-    k_weight = tl.load(k_weight_ptr + k_head_in_row[:, None] * head_dim + hd_offsets).to(tl.float32)
+    # per-head weight segments, hoisted out of the token loop
+    q_w1 = tl.load(q_weight_ptr + q_heads[:, None] * head_dim + half_offsets[None, :]).to(tl.float32)
+    q_w2 = tl.load(q_weight_ptr + q_heads[:, None] * head_dim + HALF + half_offsets[None, :]).to(tl.float32)
+    k_w1 = tl.load(k_weight_ptr + k_heads[:, None] * head_dim + half_offsets[None, :]).to(tl.float32)
+    k_w2 = tl.load(k_weight_ptr + k_heads[:, None] * head_dim + HALF + half_offsets[None, :]).to(tl.float32)
+    if PASS > 0:
+        pass_offsets = tl.arange(0, PASS)
+        q_wp = tl.load(q_weight_ptr + q_heads[:, None] * head_dim + rotary_dim + pass_offsets[None, :]).to(tl.float32)
+        k_wp = tl.load(k_weight_ptr + k_heads[:, None] * head_dim + rotary_dim + pass_offsets[None, :]).to(tl.float32)
 
     num_tiles = tl.cdiv(tokens_per_program, BLOCK_T)
     for tile_iter in tl.range(num_tiles):
-        tile_base = program_token_offset + tile_iter * BLOCK_T
+        token_offsets = program_token_offset + tile_iter * BLOCK_T + token_tile
+        token_mask = token_offsets < program_token_end
+        m2 = token_mask[:, None]
+        m3 = token_mask[:, None, None]
 
-        q_token_idx = tile_base + q_tok_in_tile
-        k_token_idx = tile_base + k_tok_in_tile
-        q_tok_mask = (q_token_idx < program_token_end) & q_row_valid
-        k_tok_mask = (k_token_idx < program_token_end) & k_row_valid
-        q_mask = q_tok_mask[:, None]
-        k_mask = k_tok_mask[:, None]
-
-        q_gv = tl.load(qk_global_var_ptr + q_token_idx * 2, mask=q_tok_mask, other=0.0).to(tl.float32)
-        k_gv = tl.load(qk_global_var_ptr + k_token_idx * 2 + 1, mask=k_tok_mask, other=0.0).to(tl.float32)
+        q_gv = tl.load(qk_global_var_ptr + token_offsets * 2, mask=token_mask, other=0.0).to(tl.float32)
+        k_gv = tl.load(qk_global_var_ptr + token_offsets * 2 + 1, mask=token_mask, other=0.0).to(tl.float32)
         q_scale = 1.0 / tl.sqrt(q_gv * inv_tp_world + eps)
         k_scale = 1.0 / tl.sqrt(k_gv * inv_tp_world + eps)
 
-        q_offsets = q_token_idx[:, None] * q_cols + q_head_in_row[:, None] * head_dim + hd_offsets
-        q_vals_raw = tl.load(q_ptr + q_offsets, mask=q_mask, other=0.0)
-        q_vals = q_vals_raw.to(tl.float32) * q_scale[:, None] * q_weight
+        cos_row = tl.load(cos_ptr + token_offsets[:, None] * cs_row_stride + half_offsets[None, :], mask=m2, other=0.0).to(tl.float32)
+        sin_row = tl.load(sin_ptr + token_offsets[:, None] * cs_row_stride + half_offsets[None, :], mask=m2, other=0.0).to(tl.float32)
+        cos_b = cos_row[:, None, :]
+        sin_b = sin_row[:, None, :]
 
-        k_offsets = k_token_idx[:, None] * k_cols + k_head_in_row[:, None] * head_dim + hd_offsets
-        k_vals_raw = tl.load(k_ptr + k_offsets, mask=k_mask, other=0.0)
-        k_vals = k_vals_raw.to(tl.float32) * k_scale[:, None] * k_weight
+        # Q: neox RoPE on the two rotary half segments, rmsnorm on the tail
+        q_base = token_offsets[:, None, None] * q_cols + q_heads[None, :, None] * head_dim
+        q1_off = q_base + half_offsets[None, None, :]
+        q2_off = q1_off + HALF
+        q1_raw = tl.load(q_ptr + q1_off, mask=m3, other=0.0)
+        q2_raw = tl.load(q_ptr + q2_off, mask=m3, other=0.0)
+        q1n = q1_raw.to(tl.float32) * q_scale[:, None, None] * q_w1[None, :, :]
+        q2n = q2_raw.to(tl.float32) * q_scale[:, None, None] * q_w2[None, :, :]
+        tl.store(q_ptr + q1_off, (q1n * cos_b - q2n * sin_b).to(q1_raw.dtype), mask=m3)
+        tl.store(q_ptr + q2_off, (q2n * cos_b + q1n * sin_b).to(q2_raw.dtype), mask=m3)
+        if PASS > 0:
+            qp_off = q_base + rotary_dim + pass_offsets[None, None, :]
+            qp_raw = tl.load(q_ptr + qp_off, mask=m3, other=0.0)
+            tl.store(q_ptr + qp_off, (qp_raw.to(tl.float32) * q_scale[:, None, None] * q_wp[None, :, :]).to(qp_raw.dtype), mask=m3)
 
-        # Neox-style RoPE on the first rotary_dim dimensions of each head;
-        # cos/sin broadcast per row: [rows, HALF]
-        q_cos = tl.load(cos_ptr + q_token_idx[:, None] * cs_row_stride + half_offsets, mask=q_mask, other=0.0).to(tl.float32)
-        q_sin = tl.load(sin_ptr + q_token_idx[:, None] * cs_row_stride + half_offsets, mask=q_mask, other=0.0).to(tl.float32)
-        k_cos = tl.load(cos_ptr + k_token_idx[:, None] * cs_row_stride + half_offsets, mask=k_mask, other=0.0).to(tl.float32)
-        k_sin = tl.load(sin_ptr + k_token_idx[:, None] * cs_row_stride + half_offsets, mask=k_mask, other=0.0).to(tl.float32)
-
-        q1 = extract_slice(q_vals, offsets=(0, 0), sizes=(q_rows_pow2, HALF), strides=(1, 1))
-        q2 = extract_slice(q_vals, offsets=(0, HALF), sizes=(q_rows_pow2, HALF), strides=(1, 1))
-        q_vals = insert_slice(
-            q_vals,
-            q1 * q_cos - q2 * q_sin,
-            offsets=(0, 0),
-            sizes=(q_rows_pow2, HALF),
-            strides=(1, 1),
-        )
-        q_vals = insert_slice(
-            q_vals,
-            q2 * q_cos + q1 * q_sin,
-            offsets=(0, HALF),
-            sizes=(q_rows_pow2, HALF),
-            strides=(1, 1),
-        )
-        tl.store(q_ptr + q_offsets, q_vals.to(q_vals_raw.dtype), mask=q_mask)
-
-        k1 = extract_slice(k_vals, offsets=(0, 0), sizes=(k_rows_pow2, HALF), strides=(1, 1))
-        k2 = extract_slice(k_vals, offsets=(0, HALF), sizes=(k_rows_pow2, HALF), strides=(1, 1))
-        k_vals = insert_slice(
-            k_vals,
-            k1 * k_cos - k2 * k_sin,
-            offsets=(0, 0),
-            sizes=(k_rows_pow2, HALF),
-            strides=(1, 1),
-        )
-        k_vals = insert_slice(
-            k_vals,
-            k2 * k_cos + k1 * k_sin,
-            offsets=(0, HALF),
-            sizes=(k_rows_pow2, HALF),
-            strides=(1, 1),
-        )
-        tl.store(k_ptr + k_offsets, k_vals.to(k_vals_raw.dtype), mask=k_mask)
+        # K: same segment structure
+        k_base = token_offsets[:, None, None] * k_cols + k_heads[None, :, None] * head_dim
+        k1_off = k_base + half_offsets[None, None, :]
+        k2_off = k1_off + HALF
+        k1_raw = tl.load(k_ptr + k1_off, mask=m3, other=0.0)
+        k2_raw = tl.load(k_ptr + k2_off, mask=m3, other=0.0)
+        k1n = k1_raw.to(tl.float32) * k_scale[:, None, None] * k_w1[None, :, :]
+        k2n = k2_raw.to(tl.float32) * k_scale[:, None, None] * k_w2[None, :, :]
+        tl.store(k_ptr + k1_off, (k1n * cos_b - k2n * sin_b).to(k1_raw.dtype), mask=m3)
+        tl.store(k_ptr + k2_off, (k2n * cos_b + k1n * sin_b).to(k2_raw.dtype), mask=m3)
+        if PASS > 0:
+            kp_off = k_base + rotary_dim + pass_offsets[None, None, :]
+            kp_raw = tl.load(k_ptr + kp_off, mask=m3, other=0.0)
+            tl.store(k_ptr + kp_off, (kp_raw.to(tl.float32) * k_scale[:, None, None] * k_wp[None, :, :]).to(kp_raw.dtype), mask=m3)
 
 
 def split_qkv_tp_rmsnorm_rope_impl(
@@ -331,9 +305,6 @@ def split_qkv_tp_rmsnorm_rope_impl(
         rotary_dim,
         rotary_dim // 2,
         _APPLY_GLOBAL_RMSNORM_BLOCK_T,
-        # tl.arange requires power-of-2 lengths on the Ascend Triton backend
-        1 << (_APPLY_GLOBAL_RMSNORM_BLOCK_T * q_num_heads - 1).bit_length(),
-        1 << (_APPLY_GLOBAL_RMSNORM_BLOCK_T * k_num_heads - 1).bit_length(),
     )
 
     return q, k, v
