@@ -19,6 +19,8 @@ import torch
 import torch_npu  # noqa: F401
 import vllm_ascend.ops  # noqa: F401  registers the custom ops
 
+from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
+
 DTYPE = torch.bfloat16
 HEAD_DIM = 128
 ROTARY_DIM = 64
@@ -137,6 +139,8 @@ def run_case(tp, q_heads, kv_heads, num_tokens):
 
 def main():
     torch.manual_seed(0)
+    init_device_properties_triton()
+    print(f"vectorcore num: {get_vectorcore_num()}")
     header = (f"{'tp':>3} {'tokens':>6} {'fused(us)':>10} {'legacy(us)':>10} {'speedup':>8}"
               f" {'scatter(us)':>11} {'saved_kb':>9} {'exact':>6}")
     print(header)
