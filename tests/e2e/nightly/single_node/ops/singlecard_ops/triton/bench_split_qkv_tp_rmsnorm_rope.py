@@ -181,6 +181,8 @@ def _apply_global_rmsnorm_kernel_tiled(
     rotary_dim: tl.constexpr,
     HALF: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    q_rows_pow2: tl.constexpr,
+    k_rows_pow2: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
     num_programs = tl.num_programs(0)
@@ -191,10 +193,14 @@ def _apply_global_rmsnorm_kernel_tiled(
     q_rows: tl.constexpr = BLOCK_T * q_num_heads
     k_rows: tl.constexpr = BLOCK_T * k_num_heads
 
-    q_row_arange = tl.arange(0, q_rows)
+    # tl.arange requires a power-of-2 length on the Ascend Triton backend;
+    # row ranges are padded and masked.
+    q_row_arange = tl.arange(0, q_rows_pow2)
+    q_row_valid = q_row_arange < q_rows
     q_head_in_row = q_row_arange % q_num_heads
     q_tok_in_tile = q_row_arange // q_num_heads
-    k_row_arange = tl.arange(0, k_rows)
+    k_row_arange = tl.arange(0, k_rows_pow2)
+    k_row_valid = k_row_arange < k_rows
     k_head_in_row = k_row_arange % k_num_heads
     k_tok_in_tile = k_row_arange // k_num_heads
 
@@ -211,8 +217,8 @@ def _apply_global_rmsnorm_kernel_tiled(
 
         q_token_idx = tile_base + q_tok_in_tile
         k_token_idx = tile_base + k_tok_in_tile
-        q_tok_mask = q_token_idx < program_token_end
-        k_tok_mask = k_token_idx < program_token_end
+        q_tok_mask = (q_token_idx < program_token_end) & q_row_valid
+        k_tok_mask = (k_token_idx < program_token_end) & k_row_valid
         q_mask = q_tok_mask[:, None]
         k_mask = k_tok_mask[:, None]
 
@@ -235,38 +241,38 @@ def _apply_global_rmsnorm_kernel_tiled(
         k_cos = tl.load(cos_ptr + k_token_idx[:, None] * cs_row_stride + half_offsets, mask=k_mask, other=0.0).to(tl.float32)
         k_sin = tl.load(sin_ptr + k_token_idx[:, None] * cs_row_stride + half_offsets, mask=k_mask, other=0.0).to(tl.float32)
 
-        q1 = extract_slice(q_vals, offsets=(0, 0), sizes=(q_rows, HALF), strides=(1, 1))
-        q2 = extract_slice(q_vals, offsets=(0, HALF), sizes=(q_rows, HALF), strides=(1, 1))
+        q1 = extract_slice(q_vals, offsets=(0, 0), sizes=(q_rows_pow2, HALF), strides=(1, 1))
+        q2 = extract_slice(q_vals, offsets=(0, HALF), sizes=(q_rows_pow2, HALF), strides=(1, 1))
         q_vals = insert_slice(
             q_vals,
             q1 * q_cos - q2 * q_sin,
             offsets=(0, 0),
-            sizes=(q_rows, HALF),
+            sizes=(q_rows_pow2, HALF),
             strides=(1, 1),
         )
         q_vals = insert_slice(
             q_vals,
             q2 * q_cos + q1 * q_sin,
             offsets=(0, HALF),
-            sizes=(q_rows, HALF),
+            sizes=(q_rows_pow2, HALF),
             strides=(1, 1),
         )
         tl.store(q_ptr + q_offsets, q_vals.to(q_vals_raw.dtype), mask=q_mask)
 
-        k1 = extract_slice(k_vals, offsets=(0, 0), sizes=(k_rows, HALF), strides=(1, 1))
-        k2 = extract_slice(k_vals, offsets=(0, HALF), sizes=(k_rows, HALF), strides=(1, 1))
+        k1 = extract_slice(k_vals, offsets=(0, 0), sizes=(k_rows_pow2, HALF), strides=(1, 1))
+        k2 = extract_slice(k_vals, offsets=(0, HALF), sizes=(k_rows_pow2, HALF), strides=(1, 1))
         k_vals = insert_slice(
             k_vals,
             k1 * k_cos - k2 * k_sin,
             offsets=(0, 0),
-            sizes=(k_rows, HALF),
+            sizes=(k_rows_pow2, HALF),
             strides=(1, 1),
         )
         k_vals = insert_slice(
             k_vals,
             k2 * k_cos + k1 * k_sin,
             offsets=(0, HALF),
-            sizes=(k_rows, HALF),
+            sizes=(k_rows_pow2, HALF),
             strides=(1, 1),
         )
         tl.store(k_ptr + k_offsets, k_vals.to(k_vals_raw.dtype), mask=k_mask)
@@ -330,12 +336,17 @@ def run_shape(tp_world, num_q_heads, num_kv_heads, num_tokens):
         )
 
     def make_run_tiled(block_t):
+        q_rows_pow2 = 1 << (block_t * num_q_heads - 1).bit_length()
+        k_rows_pow2 = 1 << (block_t * num_kv_heads - 1).bit_length()
+
         def run():
             _apply_global_rmsnorm_kernel_tiled[grid](
                 q, k, cos, sin, cos.stride(0), q_weight, k_weight, qk_var,
                 EPS, inv_tp, num_tokens, q_cols, k_cols,
                 num_q_heads, num_kv_heads, HEAD_DIM, ROTARY_DIM, HALF,
                 BLOCK_T=block_t,
+                q_rows_pow2=q_rows_pow2,
+                k_rows_pow2=k_rows_pow2,
             )
 
         return run
