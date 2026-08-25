@@ -1,0 +1,157 @@
+# Benchmark: KV-cache-fused split_qkv_tp_rmsnorm_rope (MiniMax-M2.5 shapes).
+#
+# Not collected by pytest (bench_ prefix). Run directly on an NPU machine:
+#   python tests/e2e/nightly/single_node/ops/singlecard_ops/triton/bench_split_qkv_tp_rmsnorm_rope_cache.py
+#
+# Legacy path (current M2.5 attention forward):
+#   split_qkv_tp_rmsnorm_rope -> q/k/v contiguous buffers, then
+#   npu_scatter_pa_kv_cache reads k/v back and scatters them into the
+#   paged ND cache [num_blocks, block_size, num_kv_heads, head_dim].
+# Fused path:
+#   split_qkv_tp_rmsnorm_rope_cache scatters v (kernel1) and the
+#   normed+roped k (kernel2) straight into the cache via slot_mapping,
+#   so the contiguous k/v buffers and the scatter kernel disappear.
+#
+# The fused path must reproduce the legacy cache contents bit-exactly
+# (pure data movement) and q bit-exactly (identical compute path).
+
+import torch
+import torch_npu  # noqa: F401
+import vllm_ascend.ops  # noqa: F401  registers the custom ops
+
+DTYPE = torch.bfloat16
+HEAD_DIM = 128
+ROTARY_DIM = 64
+BLOCK_SIZE = 128
+# (tp label, q heads per rank, kv heads per rank) for MiniMax-M2.5
+TP_SHAPES = [(8, 6, 1), (4, 12, 2)]
+NUM_TOKENS_LIST = [128, 256, 512, 2048, 8192, 16384]
+WARMUP_ITERS = 10
+BENCH_ITERS = 50
+SENTINEL = 7.0
+EPS = 1e-6
+
+
+def bench_us(fn, warmup=WARMUP_ITERS, iters=BENCH_ITERS):
+    for _ in range(warmup):
+        fn()
+    torch.npu.synchronize()
+    start = torch.npu.Event(enable_timing=True)
+    end = torch.npu.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.npu.synchronize()
+    return start.elapsed_time(end) / iters * 1000.0
+
+
+def run_case(tp, q_heads, kv_heads, num_tokens):
+    device = "npu:0"
+    q_cols = q_heads * HEAD_DIM
+    k_cols = kv_heads * HEAD_DIM
+
+    qkv = torch.randn(num_tokens, q_cols + 2 * k_cols, dtype=DTYPE, device=device)
+    q_weight = torch.randn(q_cols, dtype=torch.float32, device=device) * 0.1 + 1.0
+    k_weight = torch.randn(k_cols, dtype=torch.float32, device=device) * 0.1 + 1.0
+    cos = torch.rand(num_tokens, ROTARY_DIM // 2, dtype=DTYPE, device=device)
+    sin = torch.rand(num_tokens, ROTARY_DIM // 2, dtype=DTYPE, device=device)
+
+    # Paged ND caches, twice the needed slots, scattered unique slot ids.
+    num_blocks = 2 * ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE) + 8
+    cache_shape = (num_blocks, BLOCK_SIZE, kv_heads, HEAD_DIM)
+    k_cache_legacy = torch.full(cache_shape, SENTINEL, dtype=DTYPE, device=device)
+    v_cache_legacy = torch.full(cache_shape, SENTINEL, dtype=DTYPE, device=device)
+    k_cache_fused = torch.full(cache_shape, SENTINEL, dtype=DTYPE, device=device)
+    v_cache_fused = torch.full(cache_shape, SENTINEL, dtype=DTYPE, device=device)
+    slot_mapping = torch.randperm(num_blocks * BLOCK_SIZE, device=device)[:num_tokens].to(torch.int32)
+
+    def legacy():
+        q, k, v = torch.ops.vllm.split_qkv_tp_rmsnorm_rope(
+            input=qkv,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            q_hidden_size=q_cols,
+            kv_hidden_size=k_cols,
+            head_dim=HEAD_DIM,
+            rotary_dim=ROTARY_DIM,
+            eps=EPS,
+            tp_world=1,
+            cos=cos,
+            sin=sin,
+        )
+        torch_npu.npu_scatter_pa_kv_cache(
+            key=k.contiguous(),
+            value=v.contiguous(),
+            key_cache=k_cache_legacy,
+            value_cache=v_cache_legacy,
+            slot_mapping=slot_mapping,
+            cache_mode="Norm",
+        )
+        return q
+
+    def fused():
+        return torch.ops.vllm.split_qkv_tp_rmsnorm_rope_cache(
+            input=qkv,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            q_hidden_size=q_cols,
+            kv_hidden_size=k_cols,
+            head_dim=HEAD_DIM,
+            rotary_dim=ROTARY_DIM,
+            eps=EPS,
+            tp_world=1,
+            cos=cos,
+            sin=sin,
+            k_cache=k_cache_fused,
+            v_cache=v_cache_fused,
+            slot_mapping=slot_mapping,
+        )
+
+    q_legacy = legacy()
+    q_fused = fused()
+    torch.npu.synchronize()
+
+    q_exact = torch.equal(q_legacy, q_fused)
+    k_exact = torch.equal(k_cache_legacy, k_cache_fused)
+    v_exact = torch.equal(v_cache_legacy, v_cache_fused)
+    exact = q_exact and k_exact and v_exact
+
+    t_fused = bench_us(fused)
+    t_legacy = bench_us(legacy)
+    t_scatter = bench_us(
+        lambda: torch_npu.npu_scatter_pa_kv_cache(
+            key=torch.empty(num_tokens, k_cols, dtype=DTYPE, device=device),
+            value=torch.empty(num_tokens, k_cols, dtype=DTYPE, device=device),
+            key_cache=k_cache_legacy,
+            value_cache=v_cache_legacy,
+            slot_mapping=slot_mapping,
+            cache_mode="Norm",
+        ))
+
+    # Bytes the fused path skips: contiguous k/v write + read-back.
+    saved_kb = 2 * (num_tokens * k_cols * 2) * 2 / 1024
+    speedup = t_legacy / t_fused
+    return t_fused, t_legacy, speedup, t_scatter, saved_kb, exact
+
+
+def main():
+    torch.manual_seed(0)
+    header = (f"{'tp':>3} {'tokens':>6} {'fused(us)':>10} {'legacy(us)':>10} {'speedup':>8}"
+              f" {'scatter(us)':>11} {'saved_kb':>9} {'exact':>6}")
+    print(header)
+    print("-" * len(header))
+    for tp, q_heads, kv_heads in TP_SHAPES:
+        for num_tokens in NUM_TOKENS_LIST:
+            t_fused, t_legacy, speedup, t_scatter, saved_kb, exact = run_case(
+                tp, q_heads, kv_heads, num_tokens)
+            print(f"{tp:>3} {num_tokens:>6} {t_fused:>10.1f} {t_legacy:>10.1f}"
+                  f" {speedup:>7.2f}x {t_scatter:>11.1f} {saved_kb:>9.0f}"
+                  f" {'OK' if exact else 'FAIL':>6}")
+    print("-" * len(header))
+    print("legacy = split_qkv_tp_rmsnorm_rope + npu_scatter_pa_kv_cache;")
+    print("exact  = q and both paged caches bit-exact vs the legacy path.")
+
+
+if __name__ == "__main__":
+    main()
