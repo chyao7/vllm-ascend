@@ -126,14 +126,15 @@ def _split_qkv_and_compute_local_qk_var_kernel(
 
 
 # Token tile size for _apply_global_rmsnorm_kernel. Measured on Ascend 910B
-# with MiniMax-M2.5 shapes (TP4: 12q+2kv heads, TP8: 6q+1kv): BLOCK_T=4 gives
-# ~1.5x over the single-token version at 16K tokens and ties at small token
-# counts. Each head is processed as three plain 3D segments (the two rotary
-# halves and the pass-through tail) instead of extract_slice/insert_slice on
-# a flattened (token*head) row encoding: the CANN Triton backend mis-plans UB
-# for constexpr-size 3D slices, and scalarizes masked loads/stores when the
-# mask is combined with a %//-encoded row-validity term.
-_APPLY_GLOBAL_RMSNORM_BLOCK_T = 4
+# with MiniMax-M2.5 shapes (TP4: 12q+2kv heads, TP8: 6q+1kv): BLOCK_T=8 gives
+# 1.26x (TP8) / 1.12x (TP4) over the single-token version at 16K tokens and
+# ties at small token counts (host-launch bound there). Each head is processed
+# as three plain 3D segments (the two rotary halves and the pass-through tail)
+# instead of extract_slice/insert_slice on a flattened (token*head) row
+# encoding: the CANN Triton backend mis-plans UB for constexpr-size 3D slices,
+# and scalarizes masked loads/stores when the mask is combined with a
+# %//-encoded row-validity term.
+_APPLY_GLOBAL_RMSNORM_BLOCK_T = 8
 
 
 @triton.jit
