@@ -151,9 +151,12 @@ def _apply_global_rmsnorm_kernel_legacy(
 
 
 # ---------------------------------------------------------------------------
-# Tiled kernel2: BLOCK_T tokens per loop iteration. Mirrors the current
-# production kernel but with BLOCK_T passed explicitly (no autotune wrapper),
-# so the measurement is pure kernel time without host-side autotune lookup.
+# Tiled kernel2: BLOCK_T tokens per loop iteration, 2D layout.
+# Rows are (token, head) pairs: row = local_token * num_heads + head, so all
+# tiles are 2D and extract_slice/insert_slice stay on the 2D path (the CANN
+# backend mis-plans UB for 3D slices with constexpr sizes -> ub overflow).
+# BLOCK_T is passed explicitly (no autotune wrapper) to measure pure kernel
+# time without host-side autotune lookup.
 # ---------------------------------------------------------------------------
 @triton.jit
 def _apply_global_rmsnorm_kernel_tiled(
@@ -183,79 +186,86 @@ def _apply_global_rmsnorm_kernel_tiled(
     program_token_offset = pid * tokens_per_program
     program_token_end = min(program_token_offset + tokens_per_program, num_tokens)
 
-    token_tile_offsets = tl.arange(0, BLOCK_T)
-    q_head_offsets = tl.arange(0, q_num_heads)[:, None]
-    k_head_offsets = tl.arange(0, k_num_heads)[:, None]
+    q_rows: tl.constexpr = BLOCK_T * q_num_heads
+    k_rows: tl.constexpr = BLOCK_T * k_num_heads
+
+    q_row_arange = tl.arange(0, q_rows)
+    q_head_in_row = q_row_arange % q_num_heads
+    q_tok_in_tile = q_row_arange // q_num_heads
+    k_row_arange = tl.arange(0, k_rows)
+    k_head_in_row = k_row_arange % k_num_heads
+    k_tok_in_tile = k_row_arange // k_num_heads
+
     hd_offsets = tl.arange(0, head_dim)[None, :]
+    half_offsets = tl.arange(0, HALF)[None, :]
 
-    q_row_offsets = q_head_offsets * head_dim + hd_offsets
-    k_row_offsets = k_head_offsets * head_dim + hd_offsets
-
-    q_weight = tl.load(q_weight_ptr + q_row_offsets).to(tl.float32)
-    k_weight = tl.load(k_weight_ptr + k_row_offsets).to(tl.float32)
-
-    half_offsets = tl.arange(0, HALF)
+    # weight broadcast per row: [rows, head_dim]
+    q_weight = tl.load(q_weight_ptr + q_head_in_row[:, None] * head_dim + hd_offsets).to(tl.float32)
+    k_weight = tl.load(k_weight_ptr + k_head_in_row[:, None] * head_dim + hd_offsets).to(tl.float32)
 
     num_tiles = tl.cdiv(tokens_per_program, BLOCK_T)
     for tile_iter in tl.range(num_tiles):
-        token_offsets = program_token_offset + tile_iter * BLOCK_T + token_tile_offsets
-        token_mask = token_offsets < program_token_end
+        tile_base = program_token_offset + tile_iter * BLOCK_T
 
-        q_gv = tl.load(qk_global_var_ptr + token_offsets * 2, mask=token_mask, other=0.0).to(tl.float32)
-        q_gv = q_gv * inv_tp_world
-        k_gv = tl.load(qk_global_var_ptr + token_offsets * 2 + 1, mask=token_mask, other=0.0).to(tl.float32)
-        k_gv = k_gv * inv_tp_world
-        q_scale = 1.0 / tl.sqrt(q_gv + eps)
-        k_scale = 1.0 / tl.sqrt(k_gv + eps)
+        q_token_idx = tile_base + q_tok_in_tile
+        k_token_idx = tile_base + k_tok_in_tile
+        q_tok_mask = q_token_idx < program_token_end
+        k_tok_mask = k_token_idx < program_token_end
+        q_mask = q_tok_mask[:, None]
+        k_mask = k_tok_mask[:, None]
 
-        q_offsets = token_offsets[:, None, None] * q_cols + q_row_offsets[None, :, :]
-        q_mask = token_mask[:, None, None]
+        q_gv = tl.load(qk_global_var_ptr + q_token_idx * 2, mask=q_tok_mask, other=0.0).to(tl.float32)
+        k_gv = tl.load(qk_global_var_ptr + k_token_idx * 2 + 1, mask=k_tok_mask, other=0.0).to(tl.float32)
+        q_scale = 1.0 / tl.sqrt(q_gv * inv_tp_world + eps)
+        k_scale = 1.0 / tl.sqrt(k_gv * inv_tp_world + eps)
+
+        q_offsets = q_token_idx[:, None] * q_cols + q_head_in_row[:, None] * head_dim + hd_offsets
         q_vals_raw = tl.load(q_ptr + q_offsets, mask=q_mask, other=0.0)
-        q_vals = q_vals_raw.to(tl.float32) * q_scale[:, None, None] * q_weight[None, :, :]
+        q_vals = q_vals_raw.to(tl.float32) * q_scale[:, None] * q_weight
 
-        k_offsets = token_offsets[:, None, None] * k_cols + k_row_offsets[None, :, :]
-        k_mask = token_mask[:, None, None]
+        k_offsets = k_token_idx[:, None] * k_cols + k_head_in_row[:, None] * head_dim + hd_offsets
         k_vals_raw = tl.load(k_ptr + k_offsets, mask=k_mask, other=0.0)
-        k_vals = k_vals_raw.to(tl.float32) * k_scale[:, None, None] * k_weight[None, :, :]
+        k_vals = k_vals_raw.to(tl.float32) * k_scale[:, None] * k_weight
 
-        cs_offsets = token_offsets[:, None] * cs_row_stride + half_offsets[None, :]
-        cs_mask = token_mask[:, None]
-        cos_row = tl.load(cos_ptr + cs_offsets, mask=cs_mask, other=0.0).to(tl.float32)
-        sin_row = tl.load(sin_ptr + cs_offsets, mask=cs_mask, other=0.0).to(tl.float32)
+        # cos/sin broadcast per row: [rows, HALF]
+        q_cos = tl.load(cos_ptr + q_token_idx[:, None] * cs_row_stride + half_offsets, mask=q_mask, other=0.0).to(tl.float32)
+        q_sin = tl.load(sin_ptr + q_token_idx[:, None] * cs_row_stride + half_offsets, mask=q_mask, other=0.0).to(tl.float32)
+        k_cos = tl.load(cos_ptr + k_token_idx[:, None] * cs_row_stride + half_offsets, mask=k_mask, other=0.0).to(tl.float32)
+        k_sin = tl.load(sin_ptr + k_token_idx[:, None] * cs_row_stride + half_offsets, mask=k_mask, other=0.0).to(tl.float32)
 
-        q1 = extract_slice(q_vals, offsets=(0, 0, 0), sizes=(BLOCK_T, q_num_heads, HALF), strides=(1, 1, 1))
-        q2 = extract_slice(q_vals, offsets=(0, 0, HALF), sizes=(BLOCK_T, q_num_heads, HALF), strides=(1, 1, 1))
+        q1 = extract_slice(q_vals, offsets=(0, 0), sizes=(q_rows, HALF), strides=(1, 1))
+        q2 = extract_slice(q_vals, offsets=(0, HALF), sizes=(q_rows, HALF), strides=(1, 1))
         q_vals = insert_slice(
             q_vals,
-            q1 * cos_row[:, None, :] - q2 * sin_row[:, None, :],
-            offsets=(0, 0, 0),
-            sizes=(BLOCK_T, q_num_heads, HALF),
-            strides=(1, 1, 1),
+            q1 * q_cos - q2 * q_sin,
+            offsets=(0, 0),
+            sizes=(q_rows, HALF),
+            strides=(1, 1),
         )
         q_vals = insert_slice(
             q_vals,
-            q2 * cos_row[:, None, :] + q1 * sin_row[:, None, :],
-            offsets=(0, 0, HALF),
-            sizes=(BLOCK_T, q_num_heads, HALF),
-            strides=(1, 1, 1),
+            q2 * q_cos + q1 * q_sin,
+            offsets=(0, HALF),
+            sizes=(q_rows, HALF),
+            strides=(1, 1),
         )
         tl.store(q_ptr + q_offsets, q_vals.to(q_vals_raw.dtype), mask=q_mask)
 
-        k1 = extract_slice(k_vals, offsets=(0, 0, 0), sizes=(BLOCK_T, k_num_heads, HALF), strides=(1, 1, 1))
-        k2 = extract_slice(k_vals, offsets=(0, 0, HALF), sizes=(BLOCK_T, k_num_heads, HALF), strides=(1, 1, 1))
+        k1 = extract_slice(k_vals, offsets=(0, 0), sizes=(k_rows, HALF), strides=(1, 1))
+        k2 = extract_slice(k_vals, offsets=(0, HALF), sizes=(k_rows, HALF), strides=(1, 1))
         k_vals = insert_slice(
             k_vals,
-            k1 * cos_row[:, None, :] - k2 * sin_row[:, None, :],
-            offsets=(0, 0, 0),
-            sizes=(BLOCK_T, k_num_heads, HALF),
-            strides=(1, 1, 1),
+            k1 * k_cos - k2 * k_sin,
+            offsets=(0, 0),
+            sizes=(k_rows, HALF),
+            strides=(1, 1),
         )
         k_vals = insert_slice(
             k_vals,
-            k2 * cos_row[:, None, :] + k1 * sin_row[:, None, :],
-            offsets=(0, 0, HALF),
-            sizes=(BLOCK_T, k_num_heads, HALF),
-            strides=(1, 1, 1),
+            k2 * k_cos + k1 * k_sin,
+            offsets=(0, HALF),
+            sizes=(k_rows, HALF),
+            strides=(1, 1),
         )
         tl.store(k_ptr + k_offsets, k_vals.to(k_vals_raw.dtype), mask=k_mask)
 
@@ -350,8 +360,15 @@ def run_shape(tp_world, num_q_heads, num_kv_heads, num_tokens):
     tiled_errs = {}
     for bt in BLOCK_T_CANDIDATES:
         run_tiled = make_run_tiled(bt)
-        run_tiled()  # JIT compile this BLOCK_T specialization
-        torch.npu.synchronize()
+        try:
+            run_tiled()  # JIT compile this BLOCK_T specialization
+            torch.npu.synchronize()
+        except Exception:
+            # e.g. UB overflow for large BLOCK_T; skip this candidate
+            tiled_us[bt] = None
+            tiled_errs[bt] = None
+            print(f"  !! tp={tp_world} tokens={num_tokens} BLOCK_T={bt}: compile/run failed, skipped")
+            continue
         q.copy_(q0)
         k.copy_(k0)
         run_tiled()
@@ -385,9 +402,13 @@ def main():
             legacy_us, tiled_us, err_legacy, tiled_errs = run_shape(
                 tp_world, num_q_heads, num_kv_heads, num_tokens
             )
-            best_bt = min(tiled_us, key=tiled_us.get)
-            bt_vals = "".join(f" {tiled_us[bt]:>10.1f}" for bt in BLOCK_T_CANDIDATES)
-            err_tiled_max = max(tiled_errs.values())
+            ok_bts = {bt: us for bt, us in tiled_us.items() if us is not None}
+            best_bt = min(ok_bts, key=ok_bts.get) if ok_bts else "-"
+            bt_vals = "".join(
+                f" {tiled_us[bt]:>10.1f}" if tiled_us[bt] is not None else f" {'FAIL':>10}"
+                for bt in BLOCK_T_CANDIDATES
+            )
+            err_tiled_max = max(e for e in tiled_errs.values() if e is not None)
             print(
                 f"{tp_world:>3} {num_tokens:>6} {legacy_us:>11.1f}{bt_vals}"
                 f" {best_bt:>5} {err_legacy:>11.3e} {err_tiled_max:>10.3e}"
