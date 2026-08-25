@@ -120,12 +120,13 @@ def run_shape(tp_world, num_q_heads, num_kv_heads, num_tokens):
         qn, kn, _ = torch.split(qkv, [q_cols, k_cols, k_cols], dim=-1)
         qn, _ = torch.ops.npu.npu_rms_norm(qn, q_weight_npu, EPS)
         kn, _ = torch.ops.npu.npu_rms_norm(kn, k_weight_npu, EPS)
-        q3 = qn.view(num_tokens, num_q_heads, HEAD_DIM)
-        k3 = kn.view(num_tokens, num_kv_heads, HEAD_DIM)
-        q_rot = torch_npu.npu_rotary_mul(q3[..., :ROTARY_DIM], cos_full, sin_full)
-        k_rot = torch_npu.npu_rotary_mul(k3[..., :ROTARY_DIM], cos_full, sin_full)
-        torch.cat((q_rot, q3[..., ROTARY_DIM:]), dim=-1)
-        torch.cat((k_rot, k3[..., ROTARY_DIM:]), dim=-1)
+        # npu_rotary_mul requires BSHD 4D layout to broadcast with cos/sin.
+        q4 = qn.view(1, num_tokens, num_q_heads, HEAD_DIM)
+        k4 = kn.view(1, num_tokens, num_kv_heads, HEAD_DIM)
+        q_rot = torch_npu.npu_rotary_mul(q4[..., :ROTARY_DIM], cos_full, sin_full)
+        k_rot = torch_npu.npu_rotary_mul(k4[..., :ROTARY_DIM], cos_full, sin_full)
+        torch.cat((q_rot, q4[..., ROTARY_DIM:]), dim=-1)
+        torch.cat((k_rot, k4[..., ROTARY_DIM:]), dim=-1)
 
     native_us = bench_us(run_native)
 
