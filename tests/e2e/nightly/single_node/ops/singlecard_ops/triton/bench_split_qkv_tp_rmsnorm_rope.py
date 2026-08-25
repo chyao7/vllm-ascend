@@ -15,7 +15,7 @@ import vllm_ascend.ops  # noqa: F401  (registers torch.ops.vllm.split_qkv_tp_rms
 from vllm_ascend.ops.triton.linearnorm.split_qkv_tp_rmsnorm_rope import (
     _apply_global_rmsnorm_kernel,
 )
-from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
 
 DTYPE = torch.bfloat16
 EPS = 1e-6
@@ -115,6 +115,7 @@ def run_shape(tp_world, num_q_heads, num_kv_heads, num_tokens):
 
 def main():
     torch.manual_seed(0)
+    init_device_properties_triton()
     print(f"vectorcore num: {get_vectorcore_num()}")
     header = f"{'tp':>3} {'tokens':>6} {'kernel2(us)':>12} {'full_op(us)':>12} {'kernel2 GB/s':>13}"
     print(header)
