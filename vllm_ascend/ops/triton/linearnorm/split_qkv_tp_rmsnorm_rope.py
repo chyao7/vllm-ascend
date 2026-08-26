@@ -18,11 +18,18 @@
 from __future__ import annotations
 
 import torch
+import torch_npu
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ops.triton.triton_utils import extract_slice, get_vectorcore_num, insert_slice
+
+# Above this token count the in-kernel scatter stores cost more than the
+# separate CANN npu_scatter_pa_kv_cache they replace (per-kernel breakdown
+# in bench_split_qkv_tp_rmsnorm_rope_cache.py), so the op falls back to the
+# two-step legacy path for large prefill chunks.
+FUSED_CACHE_MAX_TOKENS = 4096
 
 
 # TODO: UB size differs across chips; consider whether BLOCK_SIZE can
@@ -251,104 +258,11 @@ def _apply_global_rmsnorm_kernel(
         tl.store(k_ptr + k_offsets, k_vals.to(k_vals_raw.dtype), mask=k_mask)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE": 1}),
-        triton.Config({"BLOCK_SIZE": 2}),
-        triton.Config({"BLOCK_SIZE": 4}),
-    ],
-    key=["q_cols", "k_cols"],
-)
 @triton.jit
-def _split_qkv_cache_v_and_compute_local_qk_var_kernel(
-    input_ptr,
-    q_out_ptr,
-    k_out_ptr,
-    v_cache_ptr,
-    slot_mapping_ptr,
-    qk_var_ptr,
-    num_tokens,
-    q_cols: tl.constexpr,
-    k_cols: tl.constexpr,
-    q_cols_pow2: tl.constexpr,
-    k_cols_pow2: tl.constexpr,
-    qkv_stride: tl.constexpr,
-    q_inv_size: tl.constexpr,
-    k_inv_size: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Variant of kernel1 that scatters V straight into the paged KV cache,
-    removing the separate reshape_and_cache pass for V. The ND cache
-    [num_blocks, block_size, num_kv_heads, head_dim] is addressed as flat
-    rows of k_cols elements, so slot_mapping is already the row index.
-    slot_mapping < 0 marks padding tokens whose cache write is skipped."""
-    pid = tl.program_id(0)
-    num_pids = tl.num_programs(0)
-    block_range = tl.arange(0, BLOCK_SIZE)
-
-    stride = num_pids * BLOCK_SIZE
-    start_token_idx = pid * BLOCK_SIZE
-
-    for block_start in tl.range(start_token_idx, num_tokens, stride):
-        token_indices = block_start + block_range
-        row_valid = token_indices < num_tokens
-        token_mask = row_valid[:, None]
-
-        q_offset = tl.arange(0, q_cols_pow2)[None, :]
-        q_mask = token_mask & (q_offset < q_cols)
-        q_batch = tl.load(
-            input_ptr + token_indices[:, None] * qkv_stride + q_offset,
-            mask=q_mask,
-            other=0.0,
-        )
-        q_batch_f32 = q_batch.to(tl.float32)
-
-        k_offset = tl.arange(0, k_cols_pow2)[None, :]
-        k_mask = token_mask & (k_offset < k_cols)
-        k_batch = tl.load(
-            input_ptr + token_indices[:, None] * qkv_stride + q_cols + k_offset,
-            mask=k_mask,
-            other=0.0,
-        )
-        k_batch_f32 = k_batch.to(tl.float32)
-
-        v_offset = tl.arange(0, k_cols_pow2)[None, :]
-        v_mask = token_mask & (v_offset < k_cols)
-        v_batch = tl.load(
-            input_ptr + token_indices[:, None] * qkv_stride + q_cols + k_cols + v_offset,
-            mask=v_mask,
-            other=0.0,
-        )
-
-        q_squaresum = tl.sum(q_batch_f32 * q_batch_f32, axis=-1) * q_inv_size
-        k_squaresum = tl.sum(k_batch_f32 * k_batch_f32, axis=-1) * k_inv_size
-
-        tl.store(q_out_ptr + token_indices[:, None] * q_cols + q_offset, q_batch, mask=q_mask)
-        tl.store(k_out_ptr + token_indices[:, None] * k_cols + k_offset, k_batch, mask=k_mask)
-
-        slots = tl.load(slot_mapping_ptr + token_indices, mask=row_valid, other=-1).to(tl.int64)
-        # Keep the store mask row-level: composite row*col masks get
-        # scalarized by the Ascend backend. M2.5 kv rows are powers of two
-        # (128/256), so the column range needs no mask on those shapes.
-        write_v = row_valid & (slots >= 0)
-        if k_cols_pow2 == k_cols:
-            tl.store(v_cache_ptr + slots[:, None] * k_cols + v_offset, v_batch, mask=write_v[:, None])
-        else:
-            tl.store(
-                v_cache_ptr + slots[:, None] * k_cols + v_offset,
-                v_batch,
-                mask=write_v[:, None] & (v_offset < k_cols),
-            )
-
-        var_offset = token_indices * 2
-        tl.store(qk_var_ptr + var_offset, q_squaresum, mask=row_valid)
-        tl.store(qk_var_ptr + var_offset + 1, k_squaresum, mask=row_valid)
-
-
-@triton.jit
-def _apply_global_rmsnorm_cache_k_kernel(
+def _apply_global_rmsnorm_cache_kv_kernel(
     q_ptr,
     k_ptr,
+    v_ptr,
     cos_ptr,
     sin_ptr,
     cs_row_stride,
@@ -356,6 +270,7 @@ def _apply_global_rmsnorm_cache_k_kernel(
     k_weight_ptr,
     qk_global_var_ptr,
     k_cache_ptr,
+    v_cache_ptr,
     slot_mapping_ptr,
     eps: tl.constexpr,
     inv_tp_world: tl.constexpr,
@@ -368,9 +283,12 @@ def _apply_global_rmsnorm_cache_k_kernel(
     rotary_dim: tl.constexpr,
     HALF: tl.constexpr,
 ):
-    """Variant of kernel2 that scatters the normed+roped K straight into the
-    paged KV cache (flat rows of k_cols elements indexed by slot_mapping)
-    instead of writing it back to a contiguous buffer."""
+    """Variant of kernel2 that scatters the normed+roped K and the raw V
+    straight into the paged KV cache (flat rows of k_cols elements indexed
+    by slot_mapping), replacing the separate reshape_and_cache kernel.
+    V is neither normed nor roped, so it is forwarded with the same row
+    offsets as K. Scattering here (per-token 3D stores) instead of in
+    kernel1 avoids the 2D-tile scatter that the backend scalarizes."""
     pid = tl.program_id(0).to(tl.int64)
     num_programs = tl.num_programs(0)
     tokens_per_program = tl.cdiv(num_tokens, num_programs)
@@ -474,9 +392,12 @@ def _apply_global_rmsnorm_cache_k_kernel(
         )
         slot = tl.load(slot_mapping_ptr + token_offsets, mask=token_mask, other=-1).to(tl.int64)
         k_cache_offsets = slot[:, None, None] * k_cols + k_row_offsets[None, :, :]
-        # Row-level mask only, same scalarization concern as the V store.
-        write_k = token_mask & (slot >= 0)
-        tl.store(k_cache_ptr + k_cache_offsets, k_vals.to(k_vals_raw.dtype), mask=write_k[:, None, None])
+        # Row-level mask only: composite masks get scalarized by the backend.
+        write_kv = token_mask & (slot >= 0)
+        tl.store(k_cache_ptr + k_cache_offsets, k_vals.to(k_vals_raw.dtype), mask=write_kv[:, None, None])
+        # V shares K's row layout, so both offset tensors are reused as-is.
+        v_vals = tl.load(v_ptr + k_offsets, mask=k_mask, other=0.0)
+        tl.store(v_cache_ptr + k_cache_offsets, v_vals, mask=write_kv[:, None, None])
 
 
 def split_qkv_tp_rmsnorm_rope_impl(
@@ -611,11 +532,38 @@ def split_qkv_tp_rmsnorm_rope_cache_impl(
     v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
 ) -> torch.Tensor:
-    """Fused variant that writes K/V directly into the paged KV cache,
-    eliminating the separate reshape_and_cache kernel. Returns q only.
-    The ND cache [num_blocks, block_size, num_kv_heads, head_dim] is
-    addressed as flat rows of kv_hidden_size elements via slot_mapping."""
+    """Writes K/V into the paged KV cache and returns the normed+roped q,
+    replacing the separate reshape_and_cache kernel. The ND cache
+    [num_blocks, block_size, num_kv_heads, head_dim] is addressed as flat
+    rows of kv_hidden_size elements via slot_mapping. Small batches take
+    the fused path (legacy kernel1 + cache-scattering kernel2); large
+    prefill chunks fall back to the legacy kernels plus
+    npu_scatter_pa_kv_cache (see FUSED_CACHE_MAX_TOKENS)."""
     num_tokens = input.shape[0]
+    if num_tokens > FUSED_CACHE_MAX_TOKENS:
+        q, k, v = split_qkv_tp_rmsnorm_rope_impl(
+            input,
+            q_weight,
+            k_weight,
+            q_hidden_size,
+            kv_hidden_size,
+            head_dim,
+            rotary_dim,
+            eps,
+            tp_world,
+            cos,
+            sin,
+        )
+        torch_npu.npu_scatter_pa_kv_cache(
+            key=k.view(num_tokens, -1, head_dim),
+            value=v.view(num_tokens, -1, head_dim),
+            key_cache=k_cache,
+            value_cache=v_cache,
+            slot_mapping=slot_mapping.to(torch.int32),
+            cache_mode="Norm",
+        )
+        return q
+
     input_2d = input.view(num_tokens, -1)
     q = torch.empty(num_tokens, q_hidden_size, device=input.device, dtype=input.dtype)
     if num_tokens == 0:
@@ -629,17 +577,17 @@ def split_qkv_tp_rmsnorm_rope_cache_impl(
     k_num_heads = kv_hidden_size // head_dim
 
     k = torch.empty(num_tokens, kv_hidden_size, device=input.device, dtype=input.dtype)
+    v = torch.empty(num_tokens, kv_hidden_size, device=input.device, dtype=input.dtype)
     qk_var = torch.empty(num_tokens, 2, dtype=torch.float32, device=q.device)
     q_inv_size = 1.0 / q_cols
     k_inv_size = 1.0 / k_cols
     q_cols_pow2 = 1 << (q_cols - 1).bit_length()
     k_cols_pow2 = 1 << (k_cols - 1).bit_length()
-    _split_qkv_cache_v_and_compute_local_qk_var_kernel[grid](
+    _split_qkv_and_compute_local_qk_var_kernel[grid](
         input_2d,
         q,
         k,
-        v_cache,
-        slot_mapping,
+        v,
         qk_var,
         num_tokens,
         q_cols,
@@ -657,9 +605,11 @@ def split_qkv_tp_rmsnorm_rope_cache_impl(
     sin_2d = sin.view(num_tokens, -1)
     q_2d = q.view(num_tokens, -1)
     k_2d = k.view(num_tokens, -1)
-    _apply_global_rmsnorm_cache_k_kernel[grid](
+    v_2d = v.view(num_tokens, -1)
+    _apply_global_rmsnorm_cache_kv_kernel[grid](
         q_2d,
         k_2d,
+        v_2d,
         cos_2d,
         sin_2d,
         cos_2d.stride(0),
@@ -667,6 +617,7 @@ def split_qkv_tp_rmsnorm_rope_cache_impl(
         k_weight,
         qk_var,
         k_cache,
+        v_cache,
         slot_mapping,
         eps,
         1.0 / tp_world,
