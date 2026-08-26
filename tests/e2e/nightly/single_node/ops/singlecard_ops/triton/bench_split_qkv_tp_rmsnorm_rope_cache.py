@@ -189,10 +189,29 @@ def run_kernel_breakdown(tp, q_heads, kv_heads, num_tokens):
             v_cache, slot_mapping, EPS, 1.0, num_tokens, q_cols, k_cols, q_heads,
             kv_heads, HEAD_DIM, ROTARY_DIM, ROTARY_DIM // 2)
 
+    # Same kernels but one program per token: the per-token loop collapses to
+    # a single iteration, so scatter stores from different programs can be
+    # overlapped by the hardware instead of serialized inside one program.
+    grid_t = (num_tokens,)
+
+    def k2_legacy_gt():
+        _apply_global_rmsnorm_kernel[grid_t](
+            q, k, cos, sin, cos.stride(0), q_weight, k_weight, qk_var, EPS, 1.0,
+            num_tokens, q_cols, k_cols, q_heads, kv_heads, HEAD_DIM, ROTARY_DIM,
+            ROTARY_DIM // 2)
+
+    def k2_fused_gt():
+        _apply_global_rmsnorm_cache_kv_kernel[grid_t](
+            q, k, v, cos, sin, cos.stride(0), q_weight, k_weight, qk_var, k_cache,
+            v_cache, slot_mapping, EPS, 1.0, num_tokens, q_cols, k_cols, q_heads,
+            kv_heads, HEAD_DIM, ROTARY_DIM, ROTARY_DIM // 2)
+
     t_k1 = bench_us(k1_legacy)
     t_k2_legacy = bench_us(k2_legacy)
     t_k2_fused = bench_us(k2_fused)
-    return t_k1, t_k2_legacy, t_k2_fused
+    t_k2_legacy_gt = bench_us(k2_legacy_gt)
+    t_k2_fused_gt = bench_us(k2_fused_gt)
+    return t_k1, t_k2_legacy, t_k2_fused, t_k2_legacy_gt, t_k2_fused_gt
 
 
 def main():
@@ -215,16 +234,19 @@ def main():
     print("exact  = q and both paged caches bit-exact vs the legacy path.")
 
     print("\n=== per-kernel breakdown (locate the scatter-store cost) ===")
-    header2 = (f"{'tp':>3} {'tokens':>6} {'k1(us)':>8} {'k2_leg':>8} {'k2_fus':>8} {'k2_dlt':>8}")
+    header2 = (f"{'tp':>3} {'tokens':>6} {'k1':>7} {'k2_leg':>8} {'k2_fus':>8} {'dlt':>7}"
+               f" {'leg_gt':>8} {'fus_gt':>8} {'dlt_gt':>7}")
     print(header2)
     print("-" * len(header2))
     for tp, q_heads, kv_heads in TP_SHAPES:
         for num_tokens in NUM_TOKENS_LIST:
-            t1, t2l, t2f = run_kernel_breakdown(tp, q_heads, kv_heads, num_tokens)
-            print(f"{tp:>3} {num_tokens:>6} {t1:>8.1f} {t2l:>8.1f} {t2f:>8.1f} {t2f - t2l:>+8.1f}")
+            t1, t2l, t2f, t2lg, t2fg = run_kernel_breakdown(tp, q_heads, kv_heads, num_tokens)
+            print(f"{tp:>3} {num_tokens:>6} {t1:>7.1f} {t2l:>8.1f} {t2f:>8.1f} {t2f - t2l:>+7.1f}"
+                  f" {t2lg:>8.1f} {t2fg:>8.1f} {t2fg - t2lg:>+7.1f}")
     print("-" * len(header2))
     print("k1 = split + local var (shared by both paths)")
     print("k2 = global rmsnorm + rope; fused also scatters K and forwards V into cache")
+    print("plain = grid min(tokens,48) with per-program loop; _gt = one program per token")
     print("dlt > 0 is the in-kernel scatter cost; compare against scatter(us) above.")
 
 
