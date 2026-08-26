@@ -19,6 +19,12 @@ import torch
 import torch_npu  # noqa: F401
 import vllm_ascend.ops  # noqa: F401  registers the custom ops
 
+from vllm_ascend.ops.triton.linearnorm.split_qkv_tp_rmsnorm_rope import (
+    _apply_global_rmsnorm_cache_k_kernel,
+    _apply_global_rmsnorm_kernel,
+    _split_qkv_and_compute_local_qk_var_kernel,
+    _split_qkv_cache_v_and_compute_local_qk_var_kernel,
+)
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
 
 DTYPE = torch.bfloat16
@@ -137,6 +143,66 @@ def run_case(tp, q_heads, kv_heads, num_tokens):
     return t_fused, t_legacy, speedup, t_scatter, saved_kb, exact
 
 
+def run_kernel_breakdown(tp, q_heads, kv_heads, num_tokens):
+    """Per-kernel timing to locate the scatter-store cost:
+    k1_legacy/k1_fused differ only in the V store (contiguous vs scattered);
+    k2_legacy/k2_fused differ only in the K store."""
+    device = "npu:0"
+    q_cols = q_heads * HEAD_DIM
+    k_cols = kv_heads * HEAD_DIM
+
+    qkv = torch.randn(num_tokens, q_cols + 2 * k_cols, dtype=DTYPE, device=device)
+    q_weight = torch.randn(q_cols, dtype=torch.float32, device=device) * 0.1 + 1.0
+    k_weight = torch.randn(k_cols, dtype=torch.float32, device=device) * 0.1 + 1.0
+    cos = torch.rand(num_tokens, ROTARY_DIM // 2, dtype=DTYPE, device=device)
+    sin = torch.rand(num_tokens, ROTARY_DIM // 2, dtype=DTYPE, device=device)
+
+    num_blocks = 2 * ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE) + 8
+    cache_shape = (num_blocks, BLOCK_SIZE, kv_heads, HEAD_DIM)
+    k_cache = torch.full(cache_shape, SENTINEL, dtype=DTYPE, device=device)
+    v_cache = torch.full(cache_shape, SENTINEL, dtype=DTYPE, device=device)
+    slot_mapping = torch.randperm(num_blocks * BLOCK_SIZE, device=device)[:num_tokens].to(torch.int32)
+
+    q = torch.empty(num_tokens, q_cols, dtype=DTYPE, device=device)
+    k = torch.empty(num_tokens, k_cols, dtype=DTYPE, device=device)
+    v = torch.empty(num_tokens, k_cols, dtype=DTYPE, device=device)
+    qk_var = torch.empty(num_tokens, 2, dtype=torch.float32, device=device)
+
+    grid = (min(num_tokens, get_vectorcore_num()),)
+    q_cols_pow2 = 1 << (q_cols - 1).bit_length()
+    k_cols_pow2 = 1 << (k_cols - 1).bit_length()
+    q_inv = 1.0 / q_cols
+    k_inv = 1.0 / k_cols
+
+    def k1_legacy():
+        _split_qkv_and_compute_local_qk_var_kernel[grid](
+            qkv, q, k, v, qk_var, num_tokens, q_cols, k_cols, q_cols_pow2, k_cols_pow2,
+            q_cols + 2 * k_cols, q_inv, k_inv)
+
+    def k1_fused():
+        _split_qkv_cache_v_and_compute_local_qk_var_kernel[grid](
+            qkv, q, k, v_cache, slot_mapping, qk_var, num_tokens, q_cols, k_cols,
+            q_cols_pow2, k_cols_pow2, q_cols + 2 * k_cols, q_inv, k_inv)
+
+    def k2_legacy():
+        _apply_global_rmsnorm_kernel[grid](
+            q, k, cos, sin, cos.stride(0), q_weight, k_weight, qk_var, EPS, 1.0,
+            num_tokens, q_cols, k_cols, q_heads, kv_heads, HEAD_DIM, ROTARY_DIM,
+            ROTARY_DIM // 2)
+
+    def k2_fused():
+        _apply_global_rmsnorm_cache_k_kernel[grid](
+            q, k, cos, sin, cos.stride(0), q_weight, k_weight, qk_var, k_cache,
+            slot_mapping, EPS, 1.0, num_tokens, q_cols, k_cols, q_heads, kv_heads,
+            HEAD_DIM, ROTARY_DIM, ROTARY_DIM // 2)
+
+    t_k1_legacy = bench_us(k1_legacy)
+    t_k1_fused = bench_us(k1_fused)
+    t_k2_legacy = bench_us(k2_legacy)
+    t_k2_fused = bench_us(k2_fused)
+    return t_k1_legacy, t_k1_fused, t_k2_legacy, t_k2_fused
+
+
 def main():
     torch.manual_seed(0)
     init_device_properties_triton()
@@ -155,6 +221,21 @@ def main():
     print("-" * len(header))
     print("legacy = split_qkv_tp_rmsnorm_rope + npu_scatter_pa_kv_cache;")
     print("exact  = q and both paged caches bit-exact vs the legacy path.")
+
+    print("\n=== per-kernel breakdown (locate the scatter-store cost) ===")
+    header2 = (f"{'tp':>3} {'tokens':>6} {'k1_leg':>8} {'k1_fus':>8} {'k1_dlt':>8}"
+               f" {'k2_leg':>8} {'k2_fus':>8} {'k2_dlt':>8}")
+    print(header2)
+    print("-" * len(header2))
+    for tp, q_heads, kv_heads in TP_SHAPES:
+        for num_tokens in NUM_TOKENS_LIST:
+            t1l, t1f, t2l, t2f = run_kernel_breakdown(tp, q_heads, kv_heads, num_tokens)
+            print(f"{tp:>3} {num_tokens:>6} {t1l:>8.1f} {t1f:>8.1f} {t1f - t1l:>+8.1f}"
+                  f" {t2l:>8.1f} {t2f:>8.1f} {t2f - t2l:>+8.1f}")
+    print("-" * len(header2))
+    print("k1 = split + local var (V store: contiguous vs scattered into v_cache)")
+    print("k2 = global rmsnorm + rope (K store: contiguous vs scattered into k_cache)")
+    print("dlt > 0 means the in-kernel scatter store is slower than a contiguous one.")
 
 
 if __name__ == "__main__":
