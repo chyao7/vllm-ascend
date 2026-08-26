@@ -14,6 +14,22 @@ Refer to [supported features](../../user_guide/support_matrix/supported_models.m
 
 Refer to [feature guide](../../user_guide/feature_guide/index.md) to get the feature's configuration.
 
+Experimental GQA PCP (Prefill Context Parallel) for MiniMax-M2.5 on 16 NPUs (`TP8 × PCP2`). First version is eager-only, `dcp=1`, and does not combine Eagle3, FLASHCOMM1, FUSED_MC2, C8 KV, or P/D:
+
+```bash
+vllm serve /path/to/weight/MiniMax-M2.5 \
+    --served-model-name MiniMax-M2.5 \
+    --trust-remote-code \
+    --tensor-parallel-size 8 \
+    --prefill-context-parallel-size 2 \
+    --decode-context-parallel-size 1 \
+    --enforce-eager \
+    --enable-expert-parallel \
+    --max-model-len 32768
+```
+
+Do not set `VLLM_ASCEND_ENABLE_FLASHCOMM1` or `VLLM_ASCEND_ENABLE_FUSED_MC2`. World size is `tp × pcp = 16`.
+
 ## 3 Prerequisites
 
 ### 3.1 Model Weight

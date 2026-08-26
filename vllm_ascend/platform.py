@@ -336,12 +336,53 @@ class NPUPlatform(Platform):
     @classmethod
     def _validate_parallel_config(cls, vllm_config: VllmConfig) -> None:
         parallel_config = vllm_config.parallel_config
-        if not vllm_config.use_v2_model_runner and parallel_config.prefill_context_parallel_size > 1:
+        pcp_size = parallel_config.prefill_context_parallel_size
+        if pcp_size <= 1:
+            return
+        if vllm_config.use_v2_model_runner:
             raise ValueError(
-                "PCP (Prefill Context Parallelism) is not supported by vLLM Ascend. "
-                "Please set --prefill-context-parallel-size to 1. "
-                f"Got prefill_context_parallel_size={parallel_config.prefill_context_parallel_size}."
+                "PCP (Prefill Context Parallelism) is not supported by Ascend model runner v2. "
+                "Unset VLLM_USE_V2_MODEL_RUNNER and use the v1 runner."
             )
+        if parallel_config.decode_context_parallel_size > 1:
+            raise ValueError(
+                "PCP-only execution requires --decode-context-parallel-size 1. "
+                f"Got decode_context_parallel_size={parallel_config.decode_context_parallel_size}."
+            )
+        if parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "PCP does not support pipeline parallel. "
+                f"Got pipeline_parallel_size={parallel_config.pipeline_parallel_size}."
+            )
+        model_config = vllm_config.model_config
+        if getattr(model_config, "use_mla", False):
+            raise ValueError("PCP currently supports GQA models only (e.g. MiniMax-M2.5). MLA is not supported.")
+        if vllm_config.speculative_config is not None:
+            raise ValueError("PCP does not support speculative decoding yet.")
+        if vllm_config.kv_transfer_config is not None:
+            raise ValueError("PCP does not support KV transfer / P-D disaggregation yet.")
+        from vllm_ascend import envs as ascend_envs
+
+        if ascend_envs.VLLM_ASCEND_ENABLE_FLASHCOMM1:
+            raise ValueError("PCP does not support FLASHCOMM1/sequence parallel yet. Unset VLLM_ASCEND_ENABLE_FLASHCOMM1.")
+        if ascend_envs.VLLM_ASCEND_ENABLE_FUSED_MC2:
+            raise ValueError("PCP does not support FUSED_MC2 yet. Unset VLLM_ASCEND_ENABLE_FUSED_MC2.")
+        from vllm.config.compilation import CUDAGraphMode
+
+        if model_config is not None:
+            model_config.enforce_eager = True
+        if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            logger.warning(
+                "PCP currently runs in eager mode; forcing cudagraph_mode=NONE "
+                "(was %s).",
+                vllm_config.compilation_config.cudagraph_mode,
+            )
+            vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        logger.info(
+            "Enabling GQA Prefill Context Parallel: pcp_size=%s, tp_size=%s, dcp_size=1.",
+            pcp_size,
+            parallel_config.tensor_parallel_size,
+        )
 
     @classmethod
     def _validate_draft_decode_context_parallel_config(

@@ -2,7 +2,9 @@
 
 Decode Context Parallel shards the KV cache along the sequence dimension across devices in a Tensor Parallel (TP) group. It eliminates redundant KV-cache storage without adding devices to the process world.
 
-Prefill Context Parallel is not supported by vLLM Ascend. This document describes only DCP and the separate DSA-CP sparse-attention path.
+Prefill Context Parallel is experimentally supported for GQA models with `--prefill-context-parallel-size > 1` and `--decode-context-parallel-size 1`. The first version is eager-only and does not combine PCP with DCP, pipeline parallel, speculative decoding, FLASHCOMM1, FUSED_MC2, C8 KV cache, or P/D disaggregation.
+
+This document describes DCP and the separate DSA-CP sparse-attention path.
 
 ## KV-cache layout
 

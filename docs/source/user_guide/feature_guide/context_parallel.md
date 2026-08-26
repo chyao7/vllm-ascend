@@ -4,7 +4,7 @@
 
 Decode Context Parallel (DCP) shards the KV cache along the sequence dimension across devices in a Tensor Parallel (TP) group. It removes redundant KV-cache copies and can increase the batch size available for long-context decoding.
 
-Prefill Context Parallel is not supported by vLLM Ascend. The upstream `prefill_context_parallel_size` option must remain at its default value of `1`.
+Prefill Context Parallel is experimentally supported for GQA models (for example MiniMax-M2.5) with `--prefill-context-parallel-size > 1` and `--decode-context-parallel-size 1`. The first version runs in eager mode and does not combine PCP with DCP, pipeline parallel, speculative decoding, FLASHCOMM1, FUSED_MC2, C8 KV cache, or P/D disaggregation.
 
 DSA-CP is a separate sparse-attention optimization controlled by `additional_config.enable_dsa_cp`. See [Additional Configuration](../configuration/additional_config.md) for its configuration and model requirements.
 

@@ -48,27 +48,31 @@ class TestBlockTableComputeSlotMapping(TestBase):
         """Helper method to create BlockTable with mocked distributed groups"""
 
         with patch("vllm_ascend.worker.block_table.get_dcp_group") as mock_get_dcp_group:
-            # Mock DCP group
             mock_dcp_group = MagicMock(spec=GroupCoordinator)
             mock_dcp_group.world_size = dcp_world_size
             mock_dcp_group.rank_in_group = dcp_rank
             mock_get_dcp_group.return_value = mock_dcp_group
+            with patch("vllm_ascend.worker.block_table.get_pcp_group") as mock_get_pcp_group:
+                mock_pcp_group = MagicMock(spec=GroupCoordinator)
+                mock_pcp_group.world_size = 1
+                mock_pcp_group.rank_in_group = 0
+                mock_get_pcp_group.return_value = mock_pcp_group
 
-            from vllm_ascend.worker.block_table import BlockTable
+                from vllm_ascend.worker.block_table import BlockTable
 
-            block_table = BlockTable(
-                block_size=self.block_size,
-                max_num_reqs=self.max_num_reqs,
-                max_num_blocks_per_req=self.max_num_blocks_per_req,
-                max_num_batched_tokens=self.max_num_batched_tokens,
-                pin_memory=self.pin_memory,
-                device=self.device,
-                kernel_sizes=self.kernel_sizes,
-                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-                num_speculative_tokens=0,
-            )
+                block_table = BlockTable(
+                    block_size=self.block_size,
+                    max_num_reqs=self.max_num_reqs,
+                    max_num_blocks_per_req=self.max_num_blocks_per_req,
+                    max_num_batched_tokens=self.max_num_batched_tokens,
+                    pin_memory=self.pin_memory,
+                    device=self.device,
+                    kernel_sizes=self.kernel_sizes,
+                    cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                    num_speculative_tokens=0,
+                )
 
-            return block_table
+                return block_table
 
     def setup_block_table_data(self, block_table, num_reqs=2):
         """Helper method to populate block table with test data"""

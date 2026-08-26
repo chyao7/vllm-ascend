@@ -3,7 +3,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch_npu
-from vllm.distributed import get_dcp_group
+from vllm.distributed import get_dcp_group, get_pcp_group
 
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 
@@ -231,3 +231,48 @@ def _update_out_and_lse(out_list: torch.Tensor, lse_list: torch.Tensor) -> torch
     lse_final = torch.logsumexp(lse_list, dim=0, keepdim=False)
     out_final = torch.sum(torch.exp(lse_list - lse_final) * out_list, dim=0)
     return out_final, lse_final
+
+
+class PCPImplMixin:
+    """PCP collectives. Q heads stay TP-local; merge (O, LSE) on pcp_group."""
+
+    pcp_size: int
+    pcp_rank: int
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.pcp_group = get_pcp_group()
+        self.pcp_size = self.pcp_group.world_size
+        self.pcp_rank = self.pcp_group.rank_in_group
+
+    def _pcp_all_gather(self, tensor: torch.Tensor, dim: int) -> torch.Tensor:
+        if self.pcp_size == 1:
+            return tensor
+        return self.pcp_group.all_gather(tensor.contiguous(), dim)
+
+    def _merge_pcp_attention_output(
+        self,
+        attn_output: torch.Tensor,
+        softmax_lse: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """All-gather partial (O, LSE) across PCP ranks and merge.
+
+        Unlike DCP, heads are not gathered: every rank already has the same
+        TP-local head layout, so the gather stacks the sequence dimension.
+        """
+        if softmax_lse.dim() == 2:
+            softmax_lse = softmax_lse.unsqueeze(-1)
+        if self.pcp_size == 1:
+            return attn_output, softmax_lse
+        attn_out_lse = torch.cat(
+            [attn_output.to(torch.float32), softmax_lse.to(torch.float32)],
+            dim=-1,
+        )
+        gathered = self._pcp_all_gather(attn_out_lse, dim=0)
+        seq_len = attn_output.shape[0]
+        head_size = attn_output.shape[-1]
+        num_heads = attn_output.shape[1]
+        x = gathered.view(self.pcp_size, seq_len, num_heads, head_size + 1)
+        out_list, lse_list = torch.split(x, [head_size, 1], dim=-1)
+        merged, merged_lse = _update_out_and_lse(out_list, lse_list)
+        return merged.to(attn_output.dtype), merged_lse

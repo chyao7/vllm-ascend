@@ -125,6 +125,13 @@ class AscendC8KVCacheAttentionMethod(AscendAttentionScheme):
             layer.kv_cache_torch_dtype = torch.int8
         # Upgrade impl to the C8-specific subclass so the C8 forward path is always used.
         if hasattr(layer, "impl"):
+            from vllm_ascend.attention.utils import enable_pcp
+
+            if enable_pcp():
+                raise NotImplementedError(
+                    "PCP does not support C8 KV cache yet. "
+                    "Run MiniMax-M2.5 PCP with bf16 KV (disable C8) or wait for C8+PCP."
+                )
             from vllm_ascend.attention.attention_v1 import AscendC8AttentionBackendImpl
 
             layer.impl.__class__ = AscendC8AttentionBackendImpl

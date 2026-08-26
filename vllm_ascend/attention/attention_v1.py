@@ -47,6 +47,7 @@ from vllm_ascend.attention.utils import (
     PagedAttentionGraphParam,
     cache_graph_workspace,
     enable_dcp,
+    enable_pcp,
     needs_layer_aware_fia_graph_replay,
     notify_kv_cache_written,
     split_decodes_and_prefills,
@@ -82,6 +83,10 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type["AscendAttentionBackendImpl"]:
+        if enable_pcp():
+            from vllm_ascend.attention.context_parallel.attention_pcp import AscendAttentionPCPImpl
+
+            return AscendAttentionPCPImpl
         if enable_dcp():
             from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionDCPImpl
 
@@ -90,6 +95,10 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["AscendAttentionMetadataBuilder"]:
+        if enable_pcp():
+            from vllm_ascend.attention.context_parallel.attention_pcp import AscendAttentionPCPMetadataBuilder
+
+            return AscendAttentionPCPMetadataBuilder
         if enable_dcp():
             from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionDCPMetadataBuilder
 

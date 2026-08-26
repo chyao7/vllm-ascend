@@ -40,7 +40,7 @@ from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_f
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -167,6 +167,7 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.dcp_utils import DCPAsyncSpecDecodeRebuildResult, DCPManager
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+from vllm_ascend.worker.pcp_utils import split_tokens_for_pcp
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
@@ -387,7 +388,17 @@ class NPUModelRunner(GPUModelRunner):
         except Exception:
             self.dcp_size = 1
             self.dcp_rank = 0
+        try:
+            self.pcp_size = get_pcp_group().world_size
+            self.pcp_rank = get_pcp_group().rank_in_group
+        except Exception:
+            self.pcp_size = 1
+            self.pcp_rank = 0
+        self.max_tokens_across_pcp = 0
         max_buffer_num_tokens = self.max_num_tokens
+        self._pcp_token_req_ids = torch.zeros(
+            max_buffer_num_tokens, dtype=torch.int32, device="cpu", pin_memory=self.pin_memory
+        )
         if self.dcp_size > 1:
             self.dcp_manager = DCPManager(
                 self.dcp_size,
@@ -548,6 +559,10 @@ class NPUModelRunner(GPUModelRunner):
     @property
     def use_dcp(self) -> bool:
         return self.dcp_size > 1
+
+    @property
+    def use_pcp(self) -> bool:
+        return self.pcp_size > 1
 
     def _init_device_properties(self) -> None:
         self.num_sms = None
@@ -866,6 +881,19 @@ class NPUModelRunner(GPUModelRunner):
             self.query_pos.np[: cu_num_tokens[-1]],
             out=positions_np,
         )
+
+        if self.use_pcp:
+            (
+                num_scheduled_tokens,
+                total_num_scheduled_tokens,
+                req_indices,
+                positions_np,
+                cu_num_tokens,
+            ) = self._apply_pcp_token_split(
+                num_scheduled_tokens,
+                positions_np,
+                req_indices,
+            )
 
         if self.use_dcp:
             self.dcp_manager.init_batch_info(
@@ -1247,6 +1275,71 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_metadata,
             total_num_scheduled_tokens,
         )
+
+    def _apply_pcp_token_split(
+        self,
+        num_scheduled_tokens: np.ndarray,
+        positions_np: np.ndarray,
+        req_indices: np.ndarray,
+    ) -> tuple[np.ndarray, int, np.ndarray, np.ndarray, np.ndarray]:
+        _keep_idx, new_query_lens, new_positions, new_req_indices, new_query_pos = split_tokens_for_pcp(
+            positions_np,
+            num_scheduled_tokens,
+            pcp_rank=self.pcp_rank,
+            pcp_size=self.pcp_size,
+            interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+            decode_threshold=self.decode_threshold,
+        )
+        total_num_scheduled_tokens = int(new_positions.shape[0])
+        num_scheduled_tokens[:] = new_query_lens
+        self.query_pos.np[:total_num_scheduled_tokens] = new_query_pos
+        self._pcp_token_req_ids[:total_num_scheduled_tokens] = torch.from_numpy(new_req_indices)
+        self._positions_np_buf[:total_num_scheduled_tokens] = new_positions
+        cu_num_tokens = np.cumsum(new_query_lens, dtype=np.int32)
+        local_count = torch.tensor([total_num_scheduled_tokens], device=self.device, dtype=torch.int32)
+        gathered = get_pcp_group().all_gather(local_count, 0)
+        self.max_tokens_across_pcp = int(gathered.max().item())
+        if self.max_tokens_across_pcp < total_num_scheduled_tokens:
+            self.max_tokens_across_pcp = total_num_scheduled_tokens
+        return (
+            num_scheduled_tokens,
+            total_num_scheduled_tokens,
+            new_req_indices,
+            new_positions,
+            cu_num_tokens,
+        )
+
+    def _gather_pcp_sample_hidden(self, hidden_states: torch.Tensor, logits_indices: torch.Tensor) -> torch.Tensor:
+        """Pick the hidden state of each request's last global token across PCP."""
+        num_reqs = self.input_batch.num_reqs
+        local_tokens = hidden_states.shape[0]
+        pad_to = max(self.max_tokens_across_pcp, local_tokens)
+        hidden_pad = hidden_states
+        pos = self.positions[:local_tokens]
+        req_ids = self._pcp_token_req_ids[:local_tokens].to(hidden_states.device, non_blocking=True)
+        if pad_to > local_tokens:
+            hidden_pad = torch.nn.functional.pad(hidden_states, (0, 0, 0, pad_to - local_tokens))
+            pos = torch.nn.functional.pad(pos, (0, pad_to - local_tokens), value=-1)
+            req_ids = torch.nn.functional.pad(req_ids, (0, pad_to - local_tokens), value=-1)
+        all_h = get_pcp_group().all_gather(hidden_pad[:pad_to], 0)
+        all_p = get_pcp_group().all_gather(pos[:pad_to], 0)
+        all_r = get_pcp_group().all_gather(req_ids[:pad_to], 0)
+        seq_lens = self.optimistic_seq_lens_cpu[:num_reqs].to(hidden_states.device)
+        target_pos = seq_lens - 1
+        sample = []
+        for req_i in range(num_reqs):
+            match = (all_r == req_i) & (all_p == target_pos[req_i])
+            idxs = match.nonzero(as_tuple=False)
+            if idxs.numel() == 0:
+                sample.append(hidden_states[logits_indices[req_i]])
+            else:
+                sample.append(all_h[idxs[0, 0]])
+        return torch.stack(sample, dim=0)
+
+    def _select_sample_hidden(self, hidden_states: torch.Tensor, logits_indices: torch.Tensor) -> torch.Tensor:
+        if self.use_pcp:
+            return self._gather_pcp_sample_hidden(hidden_states, logits_indices)
+        return hidden_states[logits_indices]
 
     def _build_attn_state(self, num_reqs, num_scheduled_tokens, num_valid_tokens):
         if np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] == 0):
@@ -1849,6 +1942,9 @@ class NPUModelRunner(GPUModelRunner):
                 )
 
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+                if self.use_pcp:
+                    num_tokens_unpadded = total_num_scheduled_tokens
+                    max_num_scheduled_tokens = int(num_scheduled_tokens_np.max()) if num_scheduled_tokens_np.size else 0
                 cascade_attn_prefix_lens = None
                 # Disable cascade attention when using microbatching (DBO)
                 if self.cascade_attn_enabled and not self.parallel_config.enable_dbo:
@@ -2043,6 +2139,7 @@ class NPUModelRunner(GPUModelRunner):
                 skip_compiled=has_encoder_input,
                 has_sinks=self._has_sinks,
                 input_ids=input_ids,
+                max_tokens_across_pcp=self.max_tokens_across_pcp,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
             ),
             self.maybe_get_kv_connector_output(
@@ -2081,18 +2178,18 @@ class NPUModelRunner(GPUModelRunner):
                     self._finalize_dump_data()
                     return output
 
-                sample_hidden_states = hidden_states[logits_indices]
+                sample_hidden_states = self._select_sample_hidden(hidden_states, logits_indices)
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
 
                 if not get_pp_group().is_last_rank:
-                    sample_hidden_states = hidden_states[logits_indices]
+                    sample_hidden_states = self._select_sample_hidden(hidden_states, logits_indices)
                     get_pp_group().send_tensor_dict(hidden_states.tensors, all_gather_group=get_tp_group())
                     logits = None
                 else:
-                    sample_hidden_states = hidden_states[logits_indices]
+                    sample_hidden_states = self._select_sample_hidden(hidden_states, logits_indices)
                     logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
@@ -3355,6 +3452,7 @@ class NPUModelRunner(GPUModelRunner):
                 model_instance=self.model,
                 has_sinks = self._has_sinks,
                 input_ids=input_ids,
+                max_tokens_across_pcp=num_tokens_padded,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
             ):
                 outputs = self._model_forward(

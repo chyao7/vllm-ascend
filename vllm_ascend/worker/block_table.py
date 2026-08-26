@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from vllm.distributed import get_dcp_group
+from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
@@ -28,6 +28,12 @@ class BlockTable:
         self.max_num_reqs = max_num_reqs
         self.dcp_world_size = get_dcp_group().world_size
         self.dcp_rank = get_dcp_group().rank_in_group
+        try:
+            self.pcp_world_size = get_pcp_group().world_size
+            self.pcp_rank = get_pcp_group().rank_in_group
+        except Exception:
+            self.pcp_world_size = 1
+            self.pcp_rank = 0
         compress_ratio = 1
         if (
             kv_cache_group is not None
@@ -146,8 +152,8 @@ class BlockTable:
         positions: torch.Tensor,
     ) -> None:
         num_tokens = positions.shape[0]
-        total_cp_world_size = self.dcp_world_size
-        total_cp_rank = self.dcp_rank
+        total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+        total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
         if self.dcp_world_size > 1:
             req_indices = torch.repeat_interleave(
                 torch.arange(num_reqs, dtype=torch.int32, device=query_start_loc.device),
@@ -250,12 +256,12 @@ class BlockTable:
         # but we need to map them to the correct logical block table indices
         # logical_block_idx = positions // virtual_block_size
 
-        total_cp_world_size = self.dcp_world_size
+        total_cp_world_size = self.pcp_world_size * self.dcp_world_size
         virtual_physical_block_size = self.physical_block_size * total_cp_world_size
         physical_block_idx = positions // virtual_physical_block_size
         virtual_block_offsets = positions % virtual_physical_block_size
 
-        self.current_rank = self.dcp_rank
+        self.current_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
         mask = virtual_block_offsets // self.cp_kv_cache_interleave_size % total_cp_world_size == self.current_rank
         local_physical_offsets = (
             virtual_block_offsets
